@@ -13,14 +13,14 @@ from ctypes import windll
 
 from main import TextHandler
 
-
 # ── DPI helpers ──────────────────────────────────────────────────────────
+
 
 def _enable_dpi_awareness():
     """Mark this process DPI-aware so Tkinter renders at native resolution."""
     for func in (
-        ("shcore", "SetProcessDpiAwareness", 2),   # PerMonitorV2  (Win 10+)
-        ("user32", "SetProcessDPIAware", None),     # system DPI   (Win 8-)
+        ("shcore", "SetProcessDpiAwareness", 2),  # PerMonitorV2  (Win 10+)
+        ("user32", "SetProcessDPIAware", None),  # system DPI   (Win 8-)
     ):
         try:
             getattr(windll, func[0]).__getattr__(func[1])(func[2])
@@ -39,18 +39,19 @@ def _get_dpi_scale() -> float:
 
 # ── Overlay window ───────────────────────────────────────────────────────
 
+
 class SubtitleOverlay(TextHandler):
     """Always-on-top transparent subtitle window.
 
     Displays translation text at the bottom of the screen with a
-    dark drop shadow for readability.  Click-through enabled —
-    mouse events pass through to windows beneath.
+    dark drop shadow for readability.  Drag by left-clicking any
+    blank area.  Press Escape to close.
     """
 
-    _TRANSPARENT = "#000000"   # fully transparent key
-    _SHADOW      = "#222222"   # visible shadow (must differ from _TRANSPARENT)
+    _TRANSPARENT = "#000000"
+    _SHADOW = "#111111"
 
-    def __init__(self, font_size: int = 36):
+    def __init__(self, font_size: int = 28):
         _enable_dpi_awareness()
         scale = _get_dpi_scale()
 
@@ -64,32 +65,31 @@ class SubtitleOverlay(TextHandler):
         sh = self.root.winfo_screenheight()
         w = sw
         h = max(150, int(150 * scale))
-        self.root.geometry(f"{w}x{h}+0+{sh - h - int(60 * scale)}")
+        self.root.geometry(f"{w}x{h}+0+{sh - h - int(40 * scale)}")
         self.root.configure(bg=self._TRANSPARENT)
 
         fs = int(font_size * scale)
-        soff = max(4, int(4 * scale))
+        soff = max(3, int(3 * scale))
         font = ("Segoe UI", fs, "bold")
 
         self._canvas = tk.Canvas(self.root, bg=self._TRANSPARENT, highlightthickness=0)
         self._canvas.pack(expand=True, fill="both")
 
         cx, cy = w // 2, h // 2
-        base = dict(font=font, anchor="center", justify="center", width=w - int(100 * scale))
+        base = dict(
+            font=font, anchor="center", justify="center", width=w - int(100 * scale)
+        )
 
-        self._shadows = []
-        for dx, dy in [(-soff, -soff), (-soff, soff), (soff, -soff), (soff, soff)]:
-            sid = self._canvas.create_text(cx + dx, cy + dy, fill=self._SHADOW, **base)
-            self._shadows.append(sid)
-
+        self._shadow_id = self._canvas.create_text(
+            cx + soff, cy + soff, fill=self._SHADOW, **base
+        )
         self._text_id = self._canvas.create_text(cx, cy, fill="white", **base)
 
         self._text = ""
         self._queue: queue.Queue[str] = queue.Queue()
 
         idle = "Listening..."
-        for sid in self._shadows:
-            self._canvas.itemconfig(sid, text=idle)
+        self._canvas.itemconfig(self._shadow_id, text=idle)
         self._canvas.itemconfig(self._text_id, text=idle, fill="#555555")
 
         try:
@@ -99,25 +99,51 @@ class SubtitleOverlay(TextHandler):
 
         self.root.deiconify()
         self.root.update_idletasks()
-        self._make_click_through()
+        self._make_styling()
+        self._enable_drag()
+        self._enable_close()
         self.root.after(50, self._poll)
 
-    def _make_click_through(self):
+    def _make_styling(self):
         try:
             GWL_EXSTYLE = -20
             WS_EX_LAYERED = 0x80000
-            WS_EX_TRANSPARENT = 0x20
             WS_EX_TOOLWINDOW = 0x80
-            WS_EX_NOACTIVATE = 0x08000000
             hwnd = windll.user32.GetAncestor(self.root.winfo_id(), 2)
             current = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             windll.user32.SetWindowLongW(
                 hwnd,
                 GWL_EXSTYLE,
-                current | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                current | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
             )
         except Exception:
             pass
+
+    # ── mouse drag ─────────────────────────────────────────────────
+
+    def _enable_drag(self):
+        self._drag_start = None
+        self._canvas.bind("<Button-1>", self._on_drag_start)
+        self._canvas.bind("<B1-Motion>", self._on_drag_move)
+
+    def _on_drag_start(self, event):
+        self._drag_start = (event.x_root, event.y_root)
+        self.root.focus_force()
+
+    def _on_drag_move(self, event):
+        if self._drag_start is None:
+            return
+        dx = event.x_root - self._drag_start[0]
+        dy = event.y_root - self._drag_start[1]
+        x = self.root.winfo_x() + dx
+        y = self.root.winfo_y() + dy
+        self.root.geometry(f"+{x}+{y}")
+        self._drag_start = (event.x_root, event.y_root)
+
+    # ── close via Escape ───────────────────────────────────────────
+
+    def _enable_close(self):
+        self.root.bind("<Escape>", lambda e: self.root.quit())
 
     # ── TextHandler interface (called from pipeline thread) ────────
 
@@ -136,8 +162,7 @@ class SubtitleOverlay(TextHandler):
                 if text == self._text:
                     continue
                 self._text = text
-                for sid in self._shadows:
-                    self._canvas.itemconfig(sid, text=text)
+                self._canvas.itemconfig(self._shadow_id, text=text)
                 self._canvas.itemconfig(self._text_id, text=text, fill="white")
         except queue.Empty:
             pass
