@@ -1,7 +1,9 @@
 import queue
 import sys
 import threading
+import time
 import warnings
+from collections import deque
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -15,8 +17,9 @@ transformers.logging.set_verbosity_error()
 DEVICE_INDEX = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 16000
-MIN_SECS = 2
-MAX_SECS = 10
+MIN_SECS = 1
+MAX_SECS = 8
+INTERIM_INTERVAL = 2.0
 
 
 def find_loopback_device(p):
@@ -57,15 +60,16 @@ def to_mono_16k(data, orig_rate, channels):
     )
 
 
-def worker(model, processor, q, stop_event):
+def worker(model, processor, q, partial_q, stop_event):
     while not stop_event.is_set():
         try:
-            segment = q.get(timeout=0.5)
+            item = q.get(timeout=0.5)
         except queue.Empty:
             continue
-        if segment is None:
+        if item is None:
             break
-        inputs = processor(segment, return_tensors="pt", sampling_rate=SAMPLE_RATE)
+        audio, is_final = item
+        inputs = processor(audio, return_tensors="pt", sampling_rate=SAMPLE_RATE)
         input_features = inputs.input_features.to(DEVICE, dtype=model.dtype)
         with torch.no_grad():
             generated = model.generate(
@@ -73,9 +77,16 @@ def worker(model, processor, q, stop_event):
                 temperature=0,
             )
         text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
-        if text:
+        if not text:
+            if is_final:
+                partial_q.put(None)
+            continue
+        if is_final:
+            partial_q.put(None)
             sys.stdout.write(f"\r\033[K{text}\n")
             sys.stdout.flush()
+        else:
+            partial_q.put(text)
 
 
 def main():
@@ -95,7 +106,7 @@ def main():
         model=vad_model,
         threshold=0.5,
         sampling_rate=SAMPLE_RATE,
-        min_silence_duration_ms=500,
+        min_silence_duration_ms=200,
         speech_pad_ms=50,
     )
     print("VAD loaded.\n")
@@ -124,9 +135,12 @@ def main():
     )
 
     q = queue.Queue(maxsize=4)
+    partial_q: queue.Queue[str | None] = queue.Queue()
     stop_event = threading.Event()
     t = threading.Thread(
-        target=worker, args=(model, processor, q, stop_event), daemon=True
+        target=worker,
+        args=(model, processor, q, partial_q, stop_event),
+        daemon=True,
     )
     t.start()
 
@@ -134,62 +148,97 @@ def main():
     min_samples = SAMPLE_RATE * MIN_SECS
     max_samples = SAMPLE_RATE * MAX_SECS
 
-    vad_buf = np.array([], dtype=np.float32)
-    speech_segment = np.array([], dtype=np.float32)
+    vad_buf: deque[float] = deque()
+    speech_chunks: list[np.ndarray] = []
+    speech_samples = 0
     triggered = False
-    segment_samples = 0
+    lookbehind: deque[np.ndarray] = deque(maxlen=2)
 
-    def queue_segment():
-        nonlocal speech_segment, triggered, segment_samples
-        if len(speech_segment) >= min_samples:
-            try:
-                q.put_nowait(speech_segment.copy())
-                sys.stdout.write("\r\033[K\x1b[90m───\x1b[0m\n")
-                sys.stdout.flush()
-            except queue.Full:
-                pass
-        speech_segment = np.array([], dtype=np.float32)
-        triggered = False
-        segment_samples = 0
+    last_interim_time = 0.0
+    partial_text = ""
+
+    def push_segment(is_final: bool):
+        nonlocal speech_chunks, speech_samples, triggered
+        if is_final:
+            if speech_samples >= min_samples:
+                try:
+                    q.put_nowait((np.concatenate(speech_chunks), True))
+                except queue.Full:
+                    pass
+            speech_chunks = []
+            speech_samples = 0
+            triggered = False
+        else:
+            if speech_chunks:
+                try:
+                    q.put_nowait((np.concatenate(speech_chunks), False))
+                except queue.Full:
+                    pass
 
     try:
         while True:
             raw = stream.read(1024, exception_on_overflow=False)
             samples = np.frombuffer(raw, dtype=np.int16)
             rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
-            sys.stdout.write(f"\r{rms_to_bar(rms)}  ")
+
+            # Drain latest partial text from worker
+            while True:
+                try:
+                    msg = partial_q.get_nowait()
+                    if msg is None:
+                        partial_text = ""
+                    else:
+                        partial_text = msg
+                except queue.Empty:
+                    break
+
+            # Write meter line with partial if active
+            sys.stdout.write(f"\r{rms_to_bar(rms)}")
+            if partial_text:
+                sys.stdout.write(f"  \033[90m▸\033[0m {partial_text}")
+            sys.stdout.write("  ")
             sys.stdout.flush()
 
             mono = to_mono_16k(samples, native_rate, channels)
-            vad_buf = np.concatenate([vad_buf, mono])
+            vad_buf.extend(mono.tolist())
 
             while len(vad_buf) >= VAD_WINDOW:
-                chunk = vad_buf[:VAD_WINDOW]
-                vad_buf = vad_buf[VAD_WINDOW:]
+                chunk = np.array(
+                    [vad_buf.popleft() for _ in range(VAD_WINDOW)], dtype=np.float32
+                )
 
-                chunk_t = torch.from_numpy(chunk)
-                result = vad_iterator(chunk_t, return_seconds=False)
+                result = vad_iterator(torch.from_numpy(chunk), return_seconds=False)
 
                 if result is None:
                     if triggered:
-                        speech_segment = np.concatenate([speech_segment, chunk])
-                        segment_samples += VAD_WINDOW
-                        if segment_samples >= max_samples:
-                            queue_segment()
+                        speech_chunks.append(chunk)
+                        speech_samples += VAD_WINDOW
+                        if speech_samples >= max_samples:
+                            push_segment(is_final=True)
                 elif "start" in result:
                     triggered = True
-                    speech_segment = chunk.copy()
-                    segment_samples = VAD_WINDOW
+                    speech_chunks = [*lookbehind, chunk]
+                    speech_samples = VAD_WINDOW * len(speech_chunks)
+                    last_interim_time = time.monotonic()
                 elif "end" in result:
                     if triggered:
-                        speech_segment = np.concatenate([speech_segment, chunk])
-                        segment_samples += VAD_WINDOW
-                        queue_segment()
+                        speech_chunks.append(chunk)
+                        speech_samples += VAD_WINDOW
+                        push_segment(is_final=True)
+
+                lookbehind.append(chunk)
+
+                # Push interim result periodically during active speech
+                if triggered and speech_samples >= min_samples:
+                    now = time.monotonic()
+                    if now - last_interim_time >= INTERIM_INTERVAL:
+                        push_segment(is_final=False)
+                        last_interim_time = now
 
     except KeyboardInterrupt:
-        if triggered and len(speech_segment) >= min_samples:
+        if triggered and speech_samples >= min_samples:
             try:
-                q.put_nowait(speech_segment.copy())
+                q.put_nowait((np.concatenate(speech_chunks), True))
             except queue.Full:
                 pass
         print("\n\nStopping...")
