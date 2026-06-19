@@ -1,3 +1,4 @@
+--index-url https://download.pytorch.org/whl/cu126
 PyAudioWPatch>=0.2.12
 numpy>=1.24
 transformers>=4.45
@@ -6,3 +7,4 @@ torch>=2.1
 sentencepiece>=0.2
 protobuf>=4.0
 silero-vad>=6.0
+Pillow>=10.0
