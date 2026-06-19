@@ -5,3 +5,4 @@ accelerate>=0.26
 torch>=2.1
 sentencepiece>=0.2
 protobuf>=4.0
+silero-vad>=6.0

@@ -5,6 +5,7 @@ import warnings
 
 import numpy as np
 import pyaudiowpatch as pyaudio
+import silero_vad
 import torch
 import transformers
 
@@ -16,7 +17,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 16000
 MIN_SECS = 2
 MAX_SECS = 10
-SILENCE_SECS = 0.8
 
 
 def find_loopback_device(p):
@@ -57,10 +57,6 @@ def to_mono_16k(data, orig_rate, channels):
     )
 
 
-def is_silence(audio, threshold=0.01):
-    return np.sqrt(np.mean(audio**2)) < threshold
-
-
 def worker(model, processor, q, stop_event):
     while not stop_event.is_set():
         try:
@@ -74,7 +70,6 @@ def worker(model, processor, q, stop_event):
         with torch.no_grad():
             generated = model.generate(
                 input_features,
-                task="translate",
                 temperature=0,
             )
         text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
@@ -86,13 +81,24 @@ def worker(model, processor, q, stop_event):
 def main():
     global DEVICE_INDEX
 
-    print(f"Loading Whisper large-v3-turbo on {DEVICE.upper()}...")
+    print(f"Loading Whisper large-v3 on {DEVICE.upper()}...")
     model = transformers.WhisperForConditionalGeneration.from_pretrained(
-        "openai/whisper-large-v3-turbo",
+        "openai/whisper-large-v3",
     ).to(DEVICE)
-    model.generation_config.task = "translate"
-    processor = transformers.AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+    model.generation_config.forced_decoder_ids = [[1, None], [2, 50359]]
+    processor = transformers.AutoProcessor.from_pretrained("openai/whisper-large-v3")
     print("Model loaded.\n")
+
+    print("Loading Silero VAD...")
+    vad_model = silero_vad.load_silero_vad()
+    vad_iterator = silero_vad.VADIterator(
+        model=vad_model,
+        threshold=0.5,
+        sampling_rate=SAMPLE_RATE,
+        min_silence_duration_ms=500,
+        speech_pad_ms=50,
+    )
+    print("VAD loaded.\n")
 
     p = pyaudio.PyAudio()
     if DEVICE_INDEX is None:
@@ -117,29 +123,34 @@ def main():
         frames_per_buffer=1024,
     )
 
-    q = queue.Queue(maxsize=8)
+    q = queue.Queue(maxsize=4)
     stop_event = threading.Event()
-    t = threading.Thread(target=worker, args=(model, processor, q, stop_event), daemon=True)
+    t = threading.Thread(
+        target=worker, args=(model, processor, q, stop_event), daemon=True
+    )
     t.start()
 
-    buf = np.array([], dtype=np.float32)
-    segment = np.array([], dtype=np.float32)
-    silent_chunks = 0
-    active = False
-    frame_samples = 1600  # 100ms at 16kHz
+    VAD_WINDOW = 512
     min_samples = SAMPLE_RATE * MIN_SECS
     max_samples = SAMPLE_RATE * MAX_SECS
-    silence_frames = int(SILENCE_SECS / 0.1)  # 8 frames of 100ms
 
-    def flush_segment():
-        nonlocal segment, silent_chunks, active
-        if len(segment) >= min_samples:
-            q.put_nowait(segment.copy())
-            sys.stdout.write("\r\033[K\x1b[90m───\x1b[0m\n")
-            sys.stdout.flush()
-        segment = np.array([], dtype=np.float32)
-        silent_chunks = 0
-        active = False
+    vad_buf = np.array([], dtype=np.float32)
+    speech_segment = np.array([], dtype=np.float32)
+    triggered = False
+    segment_samples = 0
+
+    def queue_segment():
+        nonlocal speech_segment, triggered, segment_samples
+        if len(speech_segment) >= min_samples:
+            try:
+                q.put_nowait(speech_segment.copy())
+                sys.stdout.write("\r\033[K\x1b[90m───\x1b[0m\n")
+                sys.stdout.flush()
+            except queue.Full:
+                pass
+        speech_segment = np.array([], dtype=np.float32)
+        triggered = False
+        segment_samples = 0
 
     try:
         while True:
@@ -149,32 +160,38 @@ def main():
             sys.stdout.write(f"\r{rms_to_bar(rms)}  ")
             sys.stdout.flush()
 
-            buf = np.concatenate([buf, to_mono_16k(samples, native_rate, channels)])
-            n = (len(buf) // frame_samples) * frame_samples
-            if n < frame_samples:
-                continue
+            mono = to_mono_16k(samples, native_rate, channels)
+            vad_buf = np.concatenate([vad_buf, mono])
 
-            frame = buf[:n]
-            buf = buf[n:]
+            while len(vad_buf) >= VAD_WINDOW:
+                chunk = vad_buf[:VAD_WINDOW]
+                vad_buf = vad_buf[VAD_WINDOW:]
 
-            for i in range(0, n, frame_samples):
-                blk = frame[i : i + frame_samples]
-                if is_silence(blk):
-                    if active:
-                        silent_chunks += 1
-                        if silent_chunks >= silence_frames:
-                            flush_segment()
-                else:
-                    silent_chunks = 0
-                    segment = np.concatenate([segment, blk])
-                    if not active:
-                        active = True
-                    if len(segment) >= max_samples:
-                        flush_segment()
+                chunk_t = torch.from_numpy(chunk)
+                result = vad_iterator(chunk_t, return_seconds=False)
+
+                if result is None:
+                    if triggered:
+                        speech_segment = np.concatenate([speech_segment, chunk])
+                        segment_samples += VAD_WINDOW
+                        if segment_samples >= max_samples:
+                            queue_segment()
+                elif "start" in result:
+                    triggered = True
+                    speech_segment = chunk.copy()
+                    segment_samples = VAD_WINDOW
+                elif "end" in result:
+                    if triggered:
+                        speech_segment = np.concatenate([speech_segment, chunk])
+                        segment_samples += VAD_WINDOW
+                        queue_segment()
 
     except KeyboardInterrupt:
-        if len(segment) >= min_samples:
-            q.put_nowait(segment.copy())
+        if triggered and len(speech_segment) >= min_samples:
+            try:
+                q.put_nowait(speech_segment.copy())
+            except queue.Full:
+                pass
         print("\n\nStopping...")
     finally:
         stop_event.set()
