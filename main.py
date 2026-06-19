@@ -15,7 +15,7 @@ DEVICE_INDEX = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 16000
 MIN_SECS = 2
-MAX_SECS = 30
+MAX_SECS = 10
 SILENCE_SECS = 0.8
 
 
@@ -24,12 +24,20 @@ def find_loopback_device(p):
     for i in range(p.get_device_count()):
         info = p.get_device_info_by_index(i)
         host = p.get_host_api_info_by_index(info["hostApi"])["name"]
-        if "wasapi" in host.lower() and info["maxInputChannels"] > 0 and "loopback" in info["name"].lower():
+        if (
+            "wasapi" in host.lower()
+            and info["maxInputChannels"] > 0
+            and "loopback" in info["name"].lower()
+        ):
             loopback_devices.append((i, info))
     if not loopback_devices:
         print("No loopback device found.")
         sys.exit(1)
-    preferred = [d for d in loopback_devices if "headphone" in d[1]["name"].lower() or "headset" in d[1]["name"].lower()]
+    preferred = [
+        d
+        for d in loopback_devices
+        if "headphone" in d[1]["name"].lower() or "headset" in d[1]["name"].lower()
+    ]
     return preferred[0] if preferred else loopback_devices[0]
 
 
@@ -39,14 +47,21 @@ def to_mono_16k(data, orig_rate, channels):
     if orig_rate == SAMPLE_RATE:
         return (data / 32768.0).astype(np.float32)
     target = int(len(data) * SAMPLE_RATE / orig_rate)
-    return np.interp(np.linspace(0, len(data) - 1, target), np.arange(len(data)), data.astype(np.float64)).astype(np.float32) / 32768.0
+    return (
+        np.interp(
+            np.linspace(0, len(data) - 1, target),
+            np.arange(len(data)),
+            data.astype(np.float64),
+        ).astype(np.float32)
+        / 32768.0
+    )
 
 
 def is_silence(audio, threshold=0.01):
-    return np.sqrt(np.mean(audio ** 2)) < threshold
+    return np.sqrt(np.mean(audio**2)) < threshold
 
 
-def worker(pipe, q, stop_event):
+def worker(model, processor, q, stop_event):
     while not stop_event.is_set():
         try:
             segment = q.get(timeout=0.5)
@@ -54,11 +69,15 @@ def worker(pipe, q, stop_event):
             continue
         if segment is None:
             break
-        result = pipe(
-            {"array": segment, "sampling_rate": SAMPLE_RATE},
-            generate_kwargs={"task": "translate", "temperature": 0},
-        )
-        text = result["text"].strip()
+        inputs = processor(segment, return_tensors="pt", sampling_rate=SAMPLE_RATE)
+        input_features = inputs.input_features.to(DEVICE, dtype=model.dtype)
+        with torch.no_grad():
+            generated = model.generate(
+                input_features,
+                task="translate",
+                temperature=0,
+            )
+        text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
         if text:
             sys.stdout.write(f"\r\033[K{text}\n")
             sys.stdout.flush()
@@ -68,11 +87,11 @@ def main():
     global DEVICE_INDEX
 
     print(f"Loading Whisper large-v3-turbo on {DEVICE.upper()}...")
-    pipe = transformers.pipeline(
-        "automatic-speech-recognition",
-        model="openai/whisper-large-v3-turbo",
-        device=DEVICE,
-    )
+    model = transformers.WhisperForConditionalGeneration.from_pretrained(
+        "openai/whisper-large-v3-turbo",
+    ).to(DEVICE)
+    model.generation_config.task = "translate"
+    processor = transformers.AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
     print("Model loaded.\n")
 
     p = pyaudio.PyAudio()
@@ -89,11 +108,18 @@ def main():
     print(f"Rate:    {native_rate} Hz | Channels: {channels}")
     print("Listening... Ctrl+C to stop.\n")
 
-    stream = p.open(format=pyaudio.paInt16, channels=channels, rate=native_rate, input=True, input_device_index=dev_idx, frames_per_buffer=1024)
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=channels,
+        rate=native_rate,
+        input=True,
+        input_device_index=dev_idx,
+        frames_per_buffer=1024,
+    )
 
     q = queue.Queue(maxsize=8)
     stop_event = threading.Event()
-    t = threading.Thread(target=worker, args=(pipe, q, stop_event), daemon=True)
+    t = threading.Thread(target=worker, args=(model, processor, q, stop_event), daemon=True)
     t.start()
 
     buf = np.array([], dtype=np.float32)
@@ -132,7 +158,7 @@ def main():
             buf = buf[n:]
 
             for i in range(0, n, frame_samples):
-                blk = frame[i:i + frame_samples]
+                blk = frame[i : i + frame_samples]
                 if is_silence(blk):
                     if active:
                         silent_chunks += 1
