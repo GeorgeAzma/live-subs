@@ -5,7 +5,7 @@
 ### How To Use
 ``` bash
 python -m venv .venv
-source .venv/bin/activate
+./.venv/Scripts/activate
 pip install -r requirements.txt
 python subtitles.py
 ```
