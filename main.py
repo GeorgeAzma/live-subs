@@ -302,9 +302,14 @@ class LiveTranslator:
         self._stop_event: Optional[threading.Event] = None
         self._worker_thread: Optional[threading.Thread] = None
 
+    def set_output(self, handler: TextHandler):
+        """Swap the output handler (e.g. from PrintHandler → SubtitleOverlay)."""
+        self._output = handler
+
     # ── lifecycle ────────────────────────────────────────────────────
 
     def start(self):
+        """Initialize models, audio, worker thread. Does not block."""
         self._load_models()
         self._audio = AudioCapture(device_index=self._device_index).open()
         self._vad = VoiceDetector(self.cfg)
@@ -319,7 +324,13 @@ class LiveTranslator:
         )
         self._worker_thread.start()
         self._running = True
-        self._pipeline_loop()
+
+    def run(self):
+        """Run the pipeline loop (blocks until Ctrl+C or stop())."""
+        try:
+            self._pipeline_loop()
+        finally:
+            self.stop()
 
     def stop(self):
         self._running = False
@@ -414,18 +425,14 @@ class LiveTranslator:
             if remaining is not None:
                 self._push_inference(remaining, True)
             print("\n\nStopping...")
-        finally:
-            self.stop()
 
 
 # ── Convenience runner ───────────────────────────────────────────────────
 
 def main():
     translator = LiveTranslator()
-    try:
-        translator.start()
-    except KeyboardInterrupt:
-        translator.stop()
+    translator.start()
+    translator.run()
 
 
 if __name__ == "__main__":
