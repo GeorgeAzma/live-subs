@@ -69,22 +69,29 @@ class SubtitleOverlay(TextHandler):
         self.root.geometry(f"{w}x{h}+0+{sh - h - int(40 * scale)}")
         self.root.configure(bg=self._TRANSPARENT)
 
-        fs = int(font_size * scale)
-        soff = max(3, int(3 * scale))
-        font = ("Segoe UI", fs, "bold")
+        self._font_size = font_size
+        self._scale = scale
+        self._canvas_width = w
+        self._canvas_height = h
+        self._soff = max(3, int(3 * scale))
+        self._cx = w // 2
+        self._cy = h // 2
 
         self._canvas = tk.Canvas(self.root, bg=self._TRANSPARENT, highlightthickness=0)
         self._canvas.pack(expand=True, fill="both")
 
-        cx, cy = w // 2, h // 2
-        base = dict(
-            font=font, anchor="center", justify="center", width=w - int(100 * scale)
-        )
+        fs = int(self._font_size * self._scale)
+        font = ("Segoe UI", fs, "bold")
+        wrap = self._canvas_width - int(100 * self._scale)
 
         self._shadow_id = self._canvas.create_text(
-            cx + soff, cy + soff, fill=self._SHADOW, **base
+            self._cx + self._soff, self._cy + self._soff,
+            fill=self._SHADOW, font=font, anchor="center", justify="center", width=wrap,
         )
-        self._text_id = self._canvas.create_text(cx, cy, fill="white", **base)
+        self._text_id = self._canvas.create_text(
+            self._cx, self._cy,
+            fill="white", font=font, anchor="center", justify="center", width=wrap,
+        )
 
         self._text = ""
         self._queue: queue.Queue[str] = queue.Queue()
@@ -103,6 +110,7 @@ class SubtitleOverlay(TextHandler):
         self._make_styling()
         self._enable_drag()
         self._enable_close()
+        self._enable_scroll()
         self.root.after(50, self._poll)
 
     def _make_styling(self):
@@ -140,6 +148,36 @@ class SubtitleOverlay(TextHandler):
         y = self.root.winfo_y() + dy
         self.root.geometry(f"+{x}+{y}")
         self._drag_start = (event.x_root, event.y_root)
+
+    # ── font size via scroll ───────────────────────────────────────
+
+    def _enable_scroll(self):
+        self._canvas.bind("<MouseWheel>", self._on_scroll)
+        self._canvas.bind("<Button-4>", self._on_scroll_up)
+        self._canvas.bind("<Button-5>", self._on_scroll_down)
+
+    def _on_scroll(self, event):
+        if event.delta > 0:
+            self._set_font_size(self._font_size + 2)
+        else:
+            self._set_font_size(self._font_size - 2)
+
+    def _on_scroll_up(self, event):
+        self._set_font_size(self._font_size + 2)
+
+    def _on_scroll_down(self, event):
+        self._set_font_size(self._font_size - 2)
+
+    def _set_font_size(self, new_size):
+        new_size = max(8, min(120, new_size))
+        if new_size == self._font_size:
+            return
+        self._font_size = new_size
+        fs = int(self._font_size * self._scale)
+        font = ("Segoe UI", fs, "bold")
+        wrap = self._canvas_width - int(100 * self._scale)
+        self._canvas.itemconfig(self._shadow_id, font=font, width=wrap)
+        self._canvas.itemconfig(self._text_id, font=font, width=wrap)
 
     # ── close via Escape ───────────────────────────────────────────
 
