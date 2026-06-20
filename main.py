@@ -42,10 +42,10 @@ class Config:
     min_silence_ms: int = 200
     speech_pad_ms: int = 50
     min_segment_seconds: float = 1.0
-    max_segment_seconds: float = 8.0
+    max_segment_seconds: float = 4.0
     interim_interval: float = 1.0
     first_interim_min_seconds: float = 0.8
-    inference_queue_size: int = 4
+    inference_queue_size: int = 16
     vad_window: int = 512
     translate_token: int = 50359
 
@@ -185,10 +185,10 @@ class VoiceDetector:
                 self.speech_chunks.append(chunk)
                 self.speech_samples += self.window
                 if self.speech_samples >= self.max_segment:
-                    return {
-                        "type": "final",
-                        "audio": np.concatenate(self.speech_chunks),
-                    }
+                    audio = np.concatenate(self.speech_chunks)
+                    self.speech_chunks.clear()
+                    self.speech_samples = 0
+                    return {"type": "final", "audio": audio}
             return {}
 
         if "start" in event:
