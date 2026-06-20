@@ -1,17 +1,3 @@
-"""Live desktop audio translator — any language → English.
-
-Architecture
-────────────
-  AudioCapture ──→ VoiceDetector ──→ inference_queue ──→ AsrWorker ──→ result_queue ──→ TextHandler
-       │                │                                                               │
-       └── main loop ───┘                                                    stdout / subtitle overlay
-
-To integrate with a subtitle overlay, implement TextHandler:
-  class SubtitleHandler:
-      def on_partial(self, text: str): ...   # interim result — update subtitle
-      def on_final(self, text: str): ...     # final result — commit subtitle
-"""
-
 import queue
 import sys
 import threading
@@ -20,7 +6,6 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
-
 import numpy as np
 import pyaudiowpatch as pyaudio
 import silero_vad
@@ -29,9 +14,6 @@ import transformers
 
 warnings.filterwarnings("ignore")
 transformers.logging.set_verbosity_error()
-
-
-# ── Configuration ────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -47,15 +29,9 @@ class Config:
     first_interim_min_seconds: float = 0.8
     inference_queue_size: int = 16
     vad_window: int = 512
-    translate_token: int = 50359
-
-
-# ── Audio capture ────────────────────────────────────────────────────────
 
 
 class AudioCapture:
-    """WASAPI loopback capture → 16 kHz mono float32 chunks."""
-
     def __init__(self, device_index: Optional[int] = None):
         self.device_index = device_index
         self._p: Optional[pyaudio.PyAudio] = None
@@ -70,20 +46,12 @@ class AudioCapture:
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
             host = p.get_host_api_info_by_index(info["hostApi"])["name"]
-            if (
-                "wasapi" in host.lower()
-                and info["maxInputChannels"] > 0
-                and "loopback" in info["name"].lower()
-            ):
+            if "wasapi" in host.lower() and info["maxInputChannels"] > 0 and "loopback" in info["name"].lower():
                 devices.append((i, info))
         if not devices:
             print("No loopback device found.")
             sys.exit(1)
-        preferred = [
-            d
-            for d in devices
-            if "headphone" in d[1]["name"].lower() or "headset" in d[1]["name"].lower()
-        ]
+        preferred = [d for d in devices if "headphone" in d[1]["name"].lower() or "headset" in d[1]["name"].lower()]
         return preferred[0] if preferred else devices[0]
 
     def open(self):
@@ -97,12 +65,8 @@ class AudioCapture:
         self.channels = int(info["maxInputChannels"])
         self.device_name = info["name"]
         self._stream = self._p.open(
-            format=pyaudio.paInt16,
-            channels=self.channels,
-            rate=self.native_rate,
-            input=True,
-            input_device_index=idx,
-            frames_per_buffer=1024,
+            format=pyaudio.paInt16, channels=self.channels, rate=self.native_rate,
+            input=True, input_device_index=idx, frames_per_buffer=1024,
         )
         return self
 
@@ -117,14 +81,7 @@ class AudioCapture:
         if self.native_rate == sr:
             return (data / 32768.0).astype(np.float32)
         target = int(len(data) * sr / self.native_rate)
-        return (
-            np.interp(
-                np.linspace(0, len(data) - 1, target),
-                np.arange(len(data)),
-                data.astype(np.float64),
-            ).astype(np.float32)
-            / 32768.0
-        )
+        return np.interp(np.linspace(0, len(data) - 1, target), np.arange(len(data)), data.astype(np.float64)).astype(np.float32) / 32768.0
 
     def close(self):
         if self._stream:
@@ -134,24 +91,12 @@ class AudioCapture:
             self._p.terminate()
 
 
-# ── Voice Activity Detection ─────────────────────────────────────────────
-
-
 class VoiceDetector:
-    """Silero VAD-based utterance state machine.
-
-    Feeds 512-sample (32 ms) windows through Silero VAD, emits utterance
-    boundaries for the pipeline main loop.
-    """
-
     def __init__(self, cfg: Config):
         model = silero_vad.load_silero_vad()
         self._vad = silero_vad.VADIterator(
-            model=model,
-            threshold=cfg.vad_threshold,
-            sampling_rate=cfg.sample_rate,
-            min_silence_duration_ms=cfg.min_silence_ms,
-            speech_pad_ms=cfg.speech_pad_ms,
+            model=model, threshold=cfg.vad_threshold, sampling_rate=cfg.sample_rate,
+            min_silence_duration_ms=cfg.min_silence_ms, speech_pad_ms=cfg.speech_pad_ms,
         )
         self.window = cfg.vad_window
         self.sample_rate = cfg.sample_rate
@@ -159,8 +104,6 @@ class VoiceDetector:
         self.max_segment = int(cfg.sample_rate * cfg.max_segment_seconds)
         self.interim_interval = cfg.interim_interval
         self.first_interim_min = int(cfg.sample_rate * cfg.first_interim_min_seconds)
-
-        # utterance state
         self.speaking = False
         self.speech_samples = 0
         self.speech_chunks: list[np.ndarray] = []
@@ -176,7 +119,6 @@ class VoiceDetector:
         self._vad.reset_states()
 
     def process(self, chunk: np.ndarray) -> dict:
-        """Process one VAD window. Returns state-change info or empty dict."""
         event = self._vad(torch.from_numpy(chunk))
         self.lookbehind.append(chunk)
 
@@ -195,7 +137,7 @@ class VoiceDetector:
             self.speaking = True
             self.speech_chunks = [*self.lookbehind, chunk]
             self.speech_samples = self.window * len(self.speech_chunks)
-            self.last_interim_time = 0  # signal: push first interim immediately
+            self.last_interim_time = 0
             return {}
 
         if "end" in event:
@@ -234,7 +176,30 @@ class VoiceDetector:
         return None
 
 
-# ── ASR worker thread ────────────────────────────────────────────────────
+def _clean_text(text: str) -> str:
+    return "".join(c for c in text if c != "\ufffd" and (c.isprintable() or c in "\n\r\t"))
+
+
+ALLOWED_LANGUAGES = ("en", "zh", "ja", "ko", "ru", "es")
+_LANG_NAMES = {
+    "en": "english", "zh": "chinese", "ja": "japanese",
+    "ko": "korean", "ru": "russian", "es": "spanish",
+}
+_LANG_IDS: dict[str, int] = {}
+
+
+def _detect_language(model, input_features, processor) -> str:
+    if not _LANG_IDS:
+        _LANG_IDS.update(
+            (c, processor.tokenizer.convert_tokens_to_ids(f"<|{c}|>"))
+            for c in ALLOWED_LANGUAGES
+        )
+    decoder_input_ids = torch.tensor([[model.config.decoder_start_token_id]], device=model.device)
+    with torch.no_grad():
+        outputs = model(input_features, decoder_input_ids=decoder_input_ids)
+        logits = outputs.logits[:, 0, :]
+    best = max(ALLOWED_LANGUAGES, key=lambda c: logits[0, _LANG_IDS[c]].item())
+    return _LANG_NAMES[best]
 
 
 def asr_worker(
@@ -243,6 +208,7 @@ def asr_worker(
     inference_queue: queue.Queue,
     result_queue: queue.Queue,
     stop_event: threading.Event,
+    translate_ref: list,
 ):
     while not stop_event.is_set():
         try:
@@ -254,29 +220,21 @@ def asr_worker(
         inputs = processor(audio, return_tensors="pt", sampling_rate=Config.sample_rate)
         input_features = inputs.input_features.to(model.device, dtype=model.dtype)
         with torch.no_grad():
-            generated = model.generate(input_features, temperature=0)
-        text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            generated = model.generate(
+                input_features, temperature=0,
+                task="translate" if translate_ref[0] else "transcribe",
+                language=_detect_language(model, input_features, processor),
+            )
+        text = _clean_text(processor.batch_decode(generated, skip_special_tokens=True)[0].strip())
         result_queue.put((text, is_final))
 
 
-# ── Output handlers ──────────────────────────────────────────────────────
-
-
 class TextHandler:
-    """Interface for consuming translation results.
-
-    Implement on_partial / on_final to receive results.
-    Optionally implement on_meter for a live sound-level indicator.
-    """
-
     def on_partial(self, text: str): ...
-
     def on_final(self, text: str): ...
 
 
 class PrintHandler(TextHandler):
-    """Default handler: prints results to terminal with a live meter line."""
-
     def on_partial(self, text: str):
         sys.stdout.write(f"\r\033[90m>\033[0m {text}  ")
         sys.stdout.flush()
@@ -293,27 +251,8 @@ class PrintHandler(TextHandler):
         sys.stdout.flush()
 
 
-# ── Main orchestrator ────────────────────────────────────────────────────
-
-
 class LiveTranslator:
-    """Real-time desktop audio translator.
-
-    Captures WASAPI loopback, detects speech via Silero VAD, translates to
-    English via Whisper. Delivers results to *output* (a TextHandler).
-
-    Example
-    -------
-    >>> t = LiveTranslator()
-    >>> t.start()                       # blocks until Ctrl+C
-    """
-
-    def __init__(
-        self,
-        cfg: Optional[Config] = None,
-        output: Optional[TextHandler] = None,
-        device_index: Optional[int] = None,
-    ):
+    def __init__(self, cfg: Optional[Config] = None, output: Optional[TextHandler] = None, device_index: Optional[int] = None):
         self.cfg = cfg or Config()
         self._device_index = device_index
         self._output = output or PrintHandler()
@@ -326,15 +265,12 @@ class LiveTranslator:
         self._result_queue: Optional[queue.Queue] = None
         self._stop_event: Optional[threading.Event] = None
         self._worker_thread: Optional[threading.Thread] = None
+        self._translate_enabled = [True]
 
     def set_output(self, handler: TextHandler):
-        """Swap the output handler (e.g. from PrintHandler → SubtitleOverlay)."""
         self._output = handler
 
-    # ── lifecycle ────────────────────────────────────────────────────
-
     def start(self):
-        """Initialize models, audio, worker thread. Does not block."""
         self._load_models()
         self._audio = AudioCapture(device_index=self._device_index).open()
         self._vad = VoiceDetector(self.cfg)
@@ -344,20 +280,13 @@ class LiveTranslator:
 
         self._worker_thread = threading.Thread(
             target=asr_worker,
-            args=(
-                self._model,
-                self._processor,
-                self._inference_queue,
-                self._result_queue,
-                self._stop_event,
-            ),
+            args=(self._model, self._processor, self._inference_queue, self._result_queue, self._stop_event, self._translate_enabled),
             daemon=True,
         )
         self._worker_thread.start()
         self._running = True
 
     def run(self):
-        """Run the pipeline loop (blocks until Ctrl+C or stop())."""
         try:
             self._pipeline_loop()
         finally:
@@ -374,28 +303,18 @@ class LiveTranslator:
         if self._audio:
             self._audio.close()
 
-    # ── model loading ────────────────────────────────────────────────
-
     def _load_models(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading {self.cfg.model_name} on {device.upper()}...")
-        self._model = transformers.WhisperForConditionalGeneration.from_pretrained(
-            self.cfg.model_name
-        ).to(device)
-        self._model.generation_config.forced_decoder_ids = [
-            [1, None],
-            [2, self.cfg.translate_token],
-        ]
-        self._processor = transformers.AutoProcessor.from_pretrained(
-            self.cfg.model_name
-        )
-        print("Model loaded.\n")
-
+        self._model = transformers.WhisperForConditionalGeneration.from_pretrained(self.cfg.model_name).to(device)
+        self._processor = transformers.AutoProcessor.from_pretrained(self.cfg.model_name)
+        print("Model loaded.")
         print("Loading Silero VAD...")
         silero_vad.load_silero_vad()
         print("VAD loaded.\n")
 
-    # ── pipeline loop ────────────────────────────────────────────────
+    def toggle_translate(self):
+        self._translate_enabled[0] = not self._translate_enabled[0]
 
     def _push_inference(self, audio: np.ndarray, is_final: bool):
         try:
@@ -419,14 +338,8 @@ class LiveTranslator:
         try:
             while self._running:
                 samples = audio.read()
-                db = 20 * np.log10(
-                    max(
-                        np.sqrt(np.mean(samples.astype(np.float64) ** 2)) / 32768.0,
-                        1e-10,
-                    )
-                )
+                db = 20 * np.log10(max(np.sqrt(np.mean(samples.astype(np.float64) ** 2)) / 32768.0, 1e-10))
 
-                # ── drain pending results ────────────────────────────
                 while True:
                     try:
                         text, is_final = self._result_queue.get_nowait()
@@ -441,21 +354,16 @@ class LiveTranslator:
                     except queue.Empty:
                         break
 
-                # ── render live line ─────────────────────────────────
                 if current_partial:
                     output.on_partial(current_partial)
                 elif use_meter:
                     output.on_meter(db, vad.speaking)
-                    self._last_meter_db = db
 
-                # ── VAD processing ───────────────────────────────────
                 mono = audio.to_mono_16k(samples)
                 raw_buf.extend(mono.tolist())
 
                 while len(raw_buf) >= vad.window:
-                    chunk = np.array(
-                        [raw_buf.popleft() for _ in range(vad.window)], dtype=np.float32
-                    )
+                    chunk = np.array([raw_buf.popleft() for _ in range(vad.window)], dtype=np.float32)
                     result = vad.process(chunk)
 
                     if result.get("type") == "final":
@@ -470,9 +378,6 @@ class LiveTranslator:
             if remaining is not None:
                 self._push_inference(remaining, True)
             print("\n\nStopping...")
-
-
-# ── Convenience runner ───────────────────────────────────────────────────
 
 
 def main():

@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""Desktop audio translator with always-on-top subtitle overlay.
-
-Run:
-    python subtitles.py
-
-Press Escape to close the overlay and stop translation.
-"""
-
 import os
 import threading
 
@@ -16,12 +7,12 @@ from overlay import SubtitleOverlay
 
 def main():
     translator = LiveTranslator()
-
     print("Loading models (this takes a moment)...")
     translator.start()
     print("Models loaded.\n")
 
     overlay = SubtitleOverlay()
+    overlay.set_translator(translator)
     translator.set_output(overlay)
 
     t = threading.Thread(target=translator.run, daemon=True)
