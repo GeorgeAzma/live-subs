@@ -85,13 +85,38 @@ class SubtitleOverlay(TextHandler):
         wrap = self._canvas_width - int(100 * self._scale)
 
         self._shadow_id = self._canvas.create_text(
-            self._cx + self._soff, self._cy + self._soff,
-            fill=self._SHADOW, font=font, anchor="center", justify="center", width=wrap,
+            self._cx + self._soff,
+            self._cy + self._soff,
+            fill=self._SHADOW,
+            font=font,
+            anchor="center",
+            justify="center",
+            width=wrap,
         )
         self._text_id = self._canvas.create_text(
-            self._cx, self._cy,
-            fill="white", font=font, anchor="center", justify="center", width=wrap,
+            self._cx,
+            self._cy,
+            fill="white",
+            font=font,
+            anchor="center",
+            justify="center",
+            width=wrap,
         )
+
+        # Second nearly-invisible window layered on top to capture
+        # mouse events across the text's bounding box (including the
+        # transparent gaps). -alpha keeps it click-capturing while
+        # making it visually imperceptible; -transparentcolor on the
+        # main window cannot do both at once.
+        self._hit_pad = max(6, int(6 * scale))
+        self._input_win = tk.Toplevel(self.root)
+        self._input_win.overrideredirect(True)
+        self._input_win.attributes("-topmost", True)
+        self._input_win.configure(bg=self._TRANSPARENT)
+        try:
+            self._input_win.attributes("-alpha", 0.01)
+        except Exception:
+            pass
 
         self._text = ""
         self._queue: queue.Queue[str] = queue.Queue()
@@ -111,6 +136,7 @@ class SubtitleOverlay(TextHandler):
         self._enable_drag()
         self._enable_close()
         self._enable_scroll()
+        self._update_hit_box()
         self.root.after(50, self._poll)
 
     def _make_styling(self):
@@ -118,13 +144,14 @@ class SubtitleOverlay(TextHandler):
             GWL_EXSTYLE = -20
             WS_EX_LAYERED = 0x80000
             WS_EX_TOOLWINDOW = 0x80
-            hwnd = windll.user32.GetAncestor(self.root.winfo_id(), 2)
-            current = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            windll.user32.SetWindowLongW(
-                hwnd,
-                GWL_EXSTYLE,
-                current | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
-            )
+            for win in (self.root, self._input_win):
+                hwnd = windll.user32.GetAncestor(win.winfo_id(), 2)
+                current = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                windll.user32.SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    current | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                )
         except Exception:
             pass
 
@@ -132,12 +159,12 @@ class SubtitleOverlay(TextHandler):
 
     def _enable_drag(self):
         self._drag_start = None
-        self._canvas.bind("<Button-1>", self._on_drag_start)
-        self._canvas.bind("<B1-Motion>", self._on_drag_move)
+        self._input_win.bind("<Button-1>", self._on_drag_start)
+        self._input_win.bind("<B1-Motion>", self._on_drag_move)
 
     def _on_drag_start(self, event):
         self._drag_start = (event.x_root, event.y_root)
-        self.root.focus_force()
+        self._input_win.focus_force()
 
     def _on_drag_move(self, event):
         if self._drag_start is None:
@@ -148,13 +175,14 @@ class SubtitleOverlay(TextHandler):
         y = self.root.winfo_y() + dy
         self.root.geometry(f"+{x}+{y}")
         self._drag_start = (event.x_root, event.y_root)
+        self._update_hit_box()
 
     # ── font size via scroll ───────────────────────────────────────
 
     def _enable_scroll(self):
-        self._canvas.bind("<MouseWheel>", self._on_scroll)
-        self._canvas.bind("<Button-4>", self._on_scroll_up)
-        self._canvas.bind("<Button-5>", self._on_scroll_down)
+        self._input_win.bind("<MouseWheel>", self._on_scroll)
+        self._input_win.bind("<Button-4>", self._on_scroll_up)
+        self._input_win.bind("<Button-5>", self._on_scroll_down)
 
     def _on_scroll(self, event):
         if event.delta > 0:
@@ -178,10 +206,28 @@ class SubtitleOverlay(TextHandler):
         wrap = self._canvas_width - int(100 * self._scale)
         self._canvas.itemconfig(self._shadow_id, font=font, width=wrap)
         self._canvas.itemconfig(self._text_id, font=font, width=wrap)
+        self._update_hit_box()
+
+    def _update_hit_box(self):
+        """Position the invisible input window over the text bounding box."""
+        self.root.update_idletasks()
+        bbox = self._canvas.bbox(self._text_id)
+        if not bbox:
+            return
+        x1, y1, x2, y2 = bbox
+        pad = self._hit_pad
+        rx = self.root.winfo_x()
+        ry = self.root.winfo_y()
+        ix = rx + x1 - pad
+        iy = ry + y1 - pad
+        iw = (x2 - x1) + 2 * pad
+        ih = (y2 - y1) + 2 * pad
+        self._input_win.geometry(f"{iw}x{ih}+{ix}+{iy}")
 
     # ── close via Escape ───────────────────────────────────────────
 
     def _enable_close(self):
+        self._input_win.bind("<Escape>", lambda e: os._exit(0))
         self.root.bind("<Escape>", lambda e: os._exit(0))
 
     # ── TextHandler interface (called from pipeline thread) ────────
@@ -203,6 +249,7 @@ class SubtitleOverlay(TextHandler):
                 self._text = text
                 self._canvas.itemconfig(self._shadow_id, text=text)
                 self._canvas.itemconfig(self._text_id, text=text, fill="white")
+                self._update_hit_box()
         except queue.Empty:
             pass
         self.root.after(50, self._poll)
