@@ -7,10 +7,15 @@ Usage
     overlay.run()  # blocks until window closes
 """
 
+import ctypes
 import os
 import queue
 import tkinter as tk
-from ctypes import windll
+from ctypes import windll, wintypes
+from typing import Optional
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from main import TextHandler
 
@@ -38,6 +43,122 @@ def _get_dpi_scale() -> float:
         return 1.0
 
 
+# ── Win32 per-pixel-alpha helpers ───────────────────────────────────────
+
+ULW_ALPHA = 0x02
+AC_SRC_OVER = 0x00
+AC_SRC_ALPHA = 0x01
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class SIZE(ctypes.Structure):
+    _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ("BlendOp", wintypes.BYTE),
+        ("BlendFlags", wintypes.BYTE),
+        ("SourceConstantAlpha", wintypes.BYTE),
+        ("AlphaFormat", wintypes.BYTE),
+    ]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", wintypes.DWORD * 3),
+    ]
+
+
+def _make_bf() -> BLENDFUNCTION:
+    bf = BLENDFUNCTION()
+    bf.BlendOp = AC_SRC_OVER
+    bf.BlendFlags = 0
+    bf.SourceConstantAlpha = 255
+    bf.AlphaFormat = AC_SRC_ALPHA
+    return bf
+
+
+def _update_layered_window(
+    hwnd: int,
+    width: int,
+    height: int,
+    bgra_bytes: bytes,
+):
+    hdc_screen = windll.user32.GetDC(0)
+    hdc_mem = windll.gdi32.CreateCompatibleDC(hdc_screen)
+
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = width
+    bmi.bmiHeader.biHeight = -height
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 3
+    bmi.bmiHeader.biSizeImage = width * height * 4
+    bmi.bmiColors[0] = 0x00FF0000
+    bmi.bmiColors[1] = 0x0000FF00
+    bmi.bmiColors[2] = 0x000000FF
+
+    ppvBits = ctypes.POINTER(ctypes.c_ubyte)()
+    hbitmap = windll.gdi32.CreateDIBSection(
+        hdc_screen, ctypes.byref(bmi), 0, ctypes.byref(ppvBits), None, 0
+    )
+    if not hbitmap:
+        windll.gdi32.DeleteDC(hdc_mem)
+        windll.user32.ReleaseDC(0, hdc_screen)
+        return
+
+    ctypes.memmove(ppvBits, bgra_bytes, len(bgra_bytes))
+
+    old = windll.gdi32.SelectObject(hdc_mem, hbitmap)
+
+    rect = wintypes.RECT()
+    windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+
+    pt_dst = POINT(rect.left, rect.top)
+    sz = SIZE(width, height)
+    pt_src = POINT(0, 0)
+    bf = _make_bf()
+
+    windll.user32.UpdateLayeredWindow(
+        hwnd,
+        hdc_screen,
+        ctypes.byref(pt_dst),
+        ctypes.byref(sz),
+        hdc_mem,
+        ctypes.byref(pt_src),
+        0,
+        ctypes.byref(bf),
+        ULW_ALPHA,
+    )
+
+    windll.gdi32.SelectObject(hdc_mem, old)
+    windll.gdi32.DeleteObject(hbitmap)
+    windll.gdi32.DeleteDC(hdc_mem)
+    windll.user32.ReleaseDC(0, hdc_screen)
+
+
 # ── Overlay window ───────────────────────────────────────────────────────
 
 
@@ -49,10 +170,9 @@ class SubtitleOverlay(TextHandler):
     blank area.  Press Escape to close.
     """
 
-    _TRANSPARENT = "#000000"
     _SHADOW = "#111111"
 
-    def __init__(self, font_size: int = 28):
+    def __init__(self, font_size: int = 30):
         _enable_dpi_awareness()
         scale = _get_dpi_scale()
 
@@ -67,80 +187,40 @@ class SubtitleOverlay(TextHandler):
         w = sw
         h = max(150, int(150 * scale))
         self.root.geometry(f"{w}x{h}+0+{sh - h - int(40 * scale)}")
-        self.root.configure(bg=self._TRANSPARENT)
 
         self._font_size = font_size
         self._scale = scale
         self._canvas_width = w
         self._canvas_height = h
         self._soff = max(3, int(3 * scale))
-        self._cx = w // 2
-        self._cy = h // 2
 
-        self._canvas = tk.Canvas(self.root, bg=self._TRANSPARENT, highlightthickness=0)
+        self._canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
         self._canvas.pack(expand=True, fill="both")
 
-        fs = int(self._font_size * self._scale)
-        font = ("Segoe UI", fs, "bold")
-        wrap = self._canvas_width - int(100 * self._scale)
-
-        self._shadow_id = self._canvas.create_text(
-            self._cx + self._soff,
-            self._cy + self._soff,
-            fill=self._SHADOW,
-            font=font,
-            anchor="center",
-            justify="center",
-            width=wrap,
-        )
-        self._text_id = self._canvas.create_text(
-            self._cx,
-            self._cy,
-            fill="white",
-            font=font,
-            anchor="center",
-            justify="center",
-            width=wrap,
-        )
-
-        # Second nearly-invisible window layered BEHIND the main
-        # overlay to capture mouse events across the text's bounding
-        # box (including the transparent gaps). The main overlay's
-        # transparent pixels are click-through via -transparentcolor,
-        # so clicks on gaps fall through to this window. -alpha keeps
-        # it click-capturing while making it visually imperceptible.
-        # Keeping it behind the text means it never veils the text's
-        # antialiased edges.
         self._hit_pad = max(6, int(6 * scale))
         self._input_win = tk.Toplevel(self.root)
         self._input_win.overrideredirect(True)
         self._input_win.attributes("-topmost", True)
-        self._input_win.configure(bg=self._TRANSPARENT)
+        self._input_win.configure(bg="black")
         try:
             self._input_win.attributes("-alpha", 0.01)
         except Exception:
             pass
-        # Re-assert root on top so the text renders above the veil.
         self.root.attributes("-topmost", True)
 
+        self._show_bg = False
         self._text = ""
         self._queue: queue.Queue[str] = queue.Queue()
-
-        idle = "Listening..."
-        self._canvas.itemconfig(self._shadow_id, text=idle)
-        self._canvas.itemconfig(self._text_id, text=idle, fill="#555555")
-
-        try:
-            self.root.attributes("-transparentcolor", self._TRANSPARENT)
-        except Exception:
-            self.root.attributes("-alpha", 0.88)
+        self._hwnd: Optional[int] = None
 
         self.root.deiconify()
         self.root.update_idletasks()
         self._make_styling()
+        self._redraw()
         self._enable_drag()
         self._enable_close()
         self._enable_scroll()
+        self._enable_toggle()
         self._update_hit_box()
         self.root.after(50, self._poll)
 
@@ -159,6 +239,100 @@ class SubtitleOverlay(TextHandler):
                 )
         except Exception:
             pass
+
+    # ── text rendering (per-pixel alpha via Win32) ───────────────────
+
+    def _render_text_image(self, text: str, is_idle: bool = False):
+        """Render text onto an RGBA PIL image with per-pixel alpha."""
+        w = self._canvas_width
+        h = self._canvas_height
+        fs = int(self._font_size * self._scale * 96.0 / 72.0)
+
+        if self._show_bg:
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 128))
+        else:
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        try:
+            font = ImageFont.truetype("segoeuib.ttf", fs)
+        except (IOError, OSError):
+            try:
+                font = ImageFont.truetype("C:/Windows/Fonts/segoeuib.ttf", fs)
+            except (IOError, OSError):
+                font = ImageFont.load_default()
+
+        wrap = w - int(100 * self._scale)
+
+        lines = self._wrap_text(text, font, wrap)
+        if not lines:
+            lines = [text]
+
+        ascent, descent = font.getmetrics()
+        line_h = ascent + descent
+        total_h = len(lines) * line_h
+        y_start = max(0, (h - total_h) // 2)
+
+        soff = self._soff
+
+        for i, line in enumerate(lines):
+            line_w = font.getlength(line)
+            x = int((w - line_w) // 2)
+            y = int(y_start + i * line_h)
+
+            if is_idle:
+                fg = (180, 180, 180, 255)
+            else:
+                fg = (255, 255, 255, 255)
+            shadow = (0, 0, 0, 255)
+
+            draw.text((x + soff, y + soff), line, font=font, fill=shadow)
+            draw.text((x, y), line, font=font, fill=fg)
+
+        return img
+
+    def _wrap_text(self, text: str, font, wrap_width: int):
+        lines = []
+        for word in text.split():
+            if not lines:
+                lines.append(word)
+                continue
+            test = f"{lines[-1]} {word}"
+            if font.getlength(test) <= wrap_width:
+                lines[-1] = test
+            else:
+                lines.append(word)
+        return lines
+
+    def _redraw(self):
+        if self._hwnd is None:
+            self._hwnd = windll.user32.GetAncestor(self.root.winfo_id(), 2)
+
+        is_idle = not self._text
+        display = self._text if self._text else "Listening..."
+        img = self._render_text_image(display, is_idle=is_idle)
+
+        arr = np.array(img, dtype=np.uint8)
+        alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+        arr[:, :, :3] = (arr[:, :, :3] * alpha).astype(np.uint8)
+        bgra = arr[:, :, [2, 1, 0, 3]]
+
+        _update_layered_window(
+            self._hwnd,
+            self._canvas_width,
+            self._canvas_height,
+            bgra.tobytes(),
+        )
+
+    # ── background toggle via Space ───────────────────────────────
+
+    def _enable_toggle(self):
+        self.root.bind("<Key-space>", self._on_toggle_bg)
+        self._input_win.bind("<Key-space>", self._on_toggle_bg)
+
+    def _on_toggle_bg(self, event):
+        self._show_bg = not self._show_bg
+        self._redraw()
 
     # ── mouse drag ─────────────────────────────────────────────────
 
@@ -209,23 +383,37 @@ class SubtitleOverlay(TextHandler):
         if new_size == self._font_size:
             return
         self._font_size = new_size
-        fs = int(self._font_size * self._scale)
-        font = ("Segoe UI", fs, "bold")
-        wrap = self._canvas_width - int(100 * self._scale)
-        self._canvas.itemconfig(self._shadow_id, font=font, width=wrap)
-        self._canvas.itemconfig(self._text_id, font=font, width=wrap)
         self._resize_to_fit_text()
+        self._redraw()
         self._update_hit_box()
 
+    # ── window sizing ──────────────────────────────────────────────
+
+    def _measure_text(self, text: str):
+        """Measure rendered text extents without drawing."""
+        fs = int(self._font_size * self._scale * 96.0 / 72.0)
+        try:
+            font = ImageFont.truetype("segoeuib.ttf", fs)
+        except (IOError, OSError):
+            try:
+                font = ImageFont.truetype("C:/Windows/Fonts/segoeuib.ttf", fs)
+            except (IOError, OSError):
+                font = ImageFont.load_default()
+        wrap = self._canvas_width - int(100 * self._scale)
+        lines = self._wrap_text(text, font, wrap)
+        if not lines:
+            lines = [text]
+        ascent, descent = font.getmetrics()
+        line_h = ascent + descent
+        total_h = len(lines) * line_h
+        max_w = max(font.getlength(l) for l in lines)
+        return lines, max_w, total_h, line_h
+
     def _resize_to_fit_text(self):
-        """Resize the overlay window to fit the rendered text height."""
-        self.root.update_idletasks()
-        bbox = self._canvas.bbox(self._text_id)
-        if not bbox:
-            return
-        _, y1, _, y2 = bbox
+        display = self._text if self._text else "Listening..."
+        _lines, _max_w, total_h, _line_h = self._measure_text(display)
         pad = int(20 * self._scale)
-        target_h = (y2 - y1) + 2 * pad
+        target_h = total_h + 2 * pad
         min_h = max(150, int(150 * self._scale))
         target_h = max(min_h, target_h)
 
@@ -236,26 +424,29 @@ class SubtitleOverlay(TextHandler):
 
         self.root.geometry(f"{self._canvas_width}x{int(target_h)}+{rx}+{int(new_y)}")
         self._canvas_height = int(target_h)
-        self._cy = self._canvas_height // 2
-
-        self._canvas.coords(self._shadow_id, self._cx + self._soff, self._cy + self._soff)
-        self._canvas.coords(self._text_id, self._cx, self._cy)
 
     def _update_hit_box(self):
-        """Position the invisible input window over the text bounding box."""
-        self.root.update_idletasks()
-        bbox = self._canvas.bbox(self._text_id)
-        if not bbox:
-            return
-        x1, y1, x2, y2 = bbox
+        display = self._text if self._text else "Listening..."
+        lines, max_w, total_h, line_h = self._measure_text(display)
+        if not lines:
+            lines = [display]
+
+        w = self._canvas_width
+        h = self._canvas_height
+        # Same positioning logic as _render_text_image
+        y_start = max(0, int((h - total_h) // 2))
+        x_start = max(0, int((w - max_w) // 2))
+
         pad = self._hit_pad
         rx = self.root.winfo_x()
         ry = self.root.winfo_y()
-        ix = rx + x1 - pad
-        iy = ry + y1 - pad
-        iw = (x2 - x1) + 2 * pad
-        ih = (y2 - y1) + 2 * pad
-        self._input_win.geometry(f"{iw}x{ih}+{ix}+{iy}")
+
+        x1 = x_start - pad
+        y1 = y_start - pad
+        x2 = x_start + int(max_w) + pad
+        y2 = y_start + total_h + pad
+
+        self._input_win.geometry(f"{x2 - x1}x{y2 - y1}+{rx + x1}+{ry + y1}")
 
     # ── close via Escape ───────────────────────────────────────────
 
@@ -280,9 +471,8 @@ class SubtitleOverlay(TextHandler):
                 if text == self._text:
                     continue
                 self._text = text
-                self._canvas.itemconfig(self._shadow_id, text=text)
-                self._canvas.itemconfig(self._text_id, text=text, fill="white")
                 self._resize_to_fit_text()
+                self._redraw()
                 self._update_hit_box()
         except queue.Empty:
             pass

@@ -13,6 +13,7 @@ python subtitles.py
 - `Drag` to move subtitle window
 - `Esc` to exit
 - `Scroll` to change font size
+- `Space` to toggle background
 
 ### Notes
 - Uses whisper-large-v3 for transcription & translation
