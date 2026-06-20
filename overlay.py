@@ -6,7 +6,7 @@ from ctypes import windll, wintypes
 from typing import Optional
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from main import TextHandler
 
@@ -164,6 +164,7 @@ class SubtitleOverlay(TextHandler):
         self.root.attributes("-topmost", True)
 
         self._show_bg = False
+        self._soft_shadow = False
         self._translator = None
         self._translating = True
         self._text = ""
@@ -229,12 +230,29 @@ class SubtitleOverlay(TextHandler):
                 fill=(0, 0, 0, 128),
             )
 
+        if not is_idle:
+            if self._soft_shadow:
+                soff = max(1, int(fs * 0.04))
+                shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                sdraw = ImageDraw.Draw(shadow)
+                for i, line in enumerate(lines):
+                    x = int((w - line_widths[i]) // 2)
+                    y = int(y_start + i * line_h)
+                    sdraw.text((x + soff, y + soff), line, font=font, fill=(0, 0, 0, 255))
+                shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(2, int(fs * 0.08))))
+                img = Image.alpha_composite(img, shadow)
+                draw = ImageDraw.Draw(img)
+            else:
+                soff = max(3, int(3 * self._scale))
+                for i, line in enumerate(lines):
+                    x = int((w - line_widths[i]) // 2)
+                    y = int(y_start + i * line_h)
+                    draw.text((x + soff, y + soff), line, font=font, fill=(0, 0, 0, 255))
+
         for i, line in enumerate(lines):
             x = int((w - line_widths[i]) // 2)
             y = int(y_start + i * line_h)
             fg = (180, 180, 180, 255) if is_idle else (255, 255, 255, 255)
-            soff = max(1, int(fs * 0.08))
-            draw.text((x + soff, y + soff), line, font=font, fill=(0, 0, 0, 255))
             draw.text((x, y), line, font=font, fill=fg)
 
         return img
@@ -299,11 +317,17 @@ class SubtitleOverlay(TextHandler):
         self._input_win.bind("<Key-space>", self._on_toggle_bg)
         self.root.bind("<Key-t>", self._on_toggle_translate)
         self._input_win.bind("<Key-t>", self._on_toggle_translate)
+        self.root.bind("<Key-s>", self._on_toggle_shadow)
+        self._input_win.bind("<Key-s>", self._on_toggle_shadow)
         self._input_win.bind("<Escape>", lambda e: os._exit(0))
         self.root.bind("<Escape>", lambda e: os._exit(0))
 
     def _on_toggle_bg(self, event):
         self._show_bg = not self._show_bg
+        self._redraw()
+
+    def _on_toggle_shadow(self, event):
+        self._soft_shadow = not self._soft_shadow
         self._redraw()
 
     def _on_toggle_translate(self, event):

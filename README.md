@@ -15,6 +15,7 @@ python subtitles.py
 - `Scroll` change font size
 - `Space` toggle background
 - `T` toggle translation
+- `S` toggle soft shadow
 
 ### Notes
 - Uses whisper-large-v3 for transcription & translation
