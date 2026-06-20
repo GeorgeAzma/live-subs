@@ -33,22 +33,24 @@ transformers.logging.set_verbosity_error()
 
 # ── Configuration ────────────────────────────────────────────────────────
 
+
 @dataclass
 class Config:
-    model_name: str = "openai/whisper-large-v3"
+    model_name: str = "openai/whisper-large-v3-turbo"
     sample_rate: int = 16000
     vad_threshold: float = 0.5
     min_silence_ms: int = 200
     speech_pad_ms: int = 50
     min_segment_seconds: float = 1.0
     max_segment_seconds: float = 8.0
-    interim_interval: float = 2.0
+    interim_interval: float = 1.0
     inference_queue_size: int = 4
     vad_window: int = 512
     translate_token: int = 50359
 
 
 # ── Audio capture ────────────────────────────────────────────────────────
+
 
 class AudioCapture:
     """WASAPI loopback capture → 16 kHz mono float32 chunks."""
@@ -67,12 +69,20 @@ class AudioCapture:
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
             host = p.get_host_api_info_by_index(info["hostApi"])["name"]
-            if "wasapi" in host.lower() and info["maxInputChannels"] > 0 and "loopback" in info["name"].lower():
+            if (
+                "wasapi" in host.lower()
+                and info["maxInputChannels"] > 0
+                and "loopback" in info["name"].lower()
+            ):
                 devices.append((i, info))
         if not devices:
             print("No loopback device found.")
             sys.exit(1)
-        preferred = [d for d in devices if "headphone" in d[1]["name"].lower() or "headset" in d[1]["name"].lower()]
+        preferred = [
+            d
+            for d in devices
+            if "headphone" in d[1]["name"].lower() or "headset" in d[1]["name"].lower()
+        ]
         return preferred[0] if preferred else devices[0]
 
     def open(self):
@@ -107,9 +117,11 @@ class AudioCapture:
             return (data / 32768.0).astype(np.float32)
         target = int(len(data) * sr / self.native_rate)
         return (
-            np.interp(np.linspace(0, len(data) - 1, target), np.arange(len(data)), data.astype(np.float64)).astype(
-                np.float32
-            )
+            np.interp(
+                np.linspace(0, len(data) - 1, target),
+                np.arange(len(data)),
+                data.astype(np.float64),
+            ).astype(np.float32)
             / 32768.0
         )
 
@@ -122,6 +134,7 @@ class AudioCapture:
 
 
 # ── Voice Activity Detection ─────────────────────────────────────────────
+
 
 class VoiceDetector:
     """Silero VAD-based utterance state machine.
@@ -170,14 +183,17 @@ class VoiceDetector:
                 self.speech_chunks.append(chunk)
                 self.speech_samples += self.window
                 if self.speech_samples >= self.max_segment:
-                    return {"type": "final", "audio": np.concatenate(self.speech_chunks)}
+                    return {
+                        "type": "final",
+                        "audio": np.concatenate(self.speech_chunks),
+                    }
             return {}
 
         if "start" in event:
             self.speaking = True
             self.speech_chunks = [*self.lookbehind, chunk]
             self.speech_samples = self.window * len(self.speech_chunks)
-            self.last_interim_time = time.monotonic()
+            self.last_interim_time = 0  # signal: push first interim immediately
             return {}
 
         if "end" in event:
@@ -197,11 +213,15 @@ class VoiceDetector:
         self.speaking = False
 
     def should_push_interim(self) -> Optional[np.ndarray]:
-        if self.speaking and self.speech_samples >= self.min_segment:
-            now = time.monotonic()
-            if now - self.last_interim_time >= self.interim_interval:
-                self.last_interim_time = now
-                return np.concatenate(self.speech_chunks)
+        if not self.speaking or not self.speech_chunks:
+            return None
+        now = time.monotonic()
+        if self.last_interim_time == 0:
+            self.last_interim_time = now
+            return np.concatenate(self.speech_chunks)
+        if now - self.last_interim_time >= self.interim_interval:
+            self.last_interim_time = now
+            return np.concatenate(self.speech_chunks)
         return None
 
     def snapshot_segment(self) -> Optional[np.ndarray]:
@@ -211,6 +231,7 @@ class VoiceDetector:
 
 
 # ── ASR worker thread ────────────────────────────────────────────────────
+
 
 def asr_worker(
     model: transformers.WhisperForConditionalGeneration,
@@ -236,6 +257,7 @@ def asr_worker(
 
 # ── Output handlers ──────────────────────────────────────────────────────
 
+
 class TextHandler:
     """Interface for consuming translation results.
 
@@ -243,11 +265,9 @@ class TextHandler:
     Optionally implement on_meter for a live sound-level indicator.
     """
 
-    def on_partial(self, text: str):
-        ...
+    def on_partial(self, text: str): ...
 
-    def on_final(self, text: str):
-        ...
+    def on_final(self, text: str): ...
 
 
 class PrintHandler(TextHandler):
@@ -270,6 +290,7 @@ class PrintHandler(TextHandler):
 
 
 # ── Main orchestrator ────────────────────────────────────────────────────
+
 
 class LiveTranslator:
     """Real-time desktop audio translator.
@@ -319,7 +340,13 @@ class LiveTranslator:
 
         self._worker_thread = threading.Thread(
             target=asr_worker,
-            args=(self._model, self._processor, self._inference_queue, self._result_queue, self._stop_event),
+            args=(
+                self._model,
+                self._processor,
+                self._inference_queue,
+                self._result_queue,
+                self._stop_event,
+            ),
             daemon=True,
         )
         self._worker_thread.start()
@@ -348,9 +375,16 @@ class LiveTranslator:
     def _load_models(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading {self.cfg.model_name} on {device.upper()}...")
-        self._model = transformers.WhisperForConditionalGeneration.from_pretrained(self.cfg.model_name).to(device)
-        self._model.generation_config.forced_decoder_ids = [[1, None], [2, self.cfg.translate_token]]
-        self._processor = transformers.AutoProcessor.from_pretrained(self.cfg.model_name)
+        self._model = transformers.WhisperForConditionalGeneration.from_pretrained(
+            self.cfg.model_name
+        ).to(device)
+        self._model.generation_config.forced_decoder_ids = [
+            [1, None],
+            [2, self.cfg.translate_token],
+        ]
+        self._processor = transformers.AutoProcessor.from_pretrained(
+            self.cfg.model_name
+        )
         print("Model loaded.\n")
 
         print("Loading Silero VAD...")
@@ -381,7 +415,12 @@ class LiveTranslator:
         try:
             while self._running:
                 samples = audio.read()
-                db = 20 * np.log10(max(np.sqrt(np.mean(samples.astype(np.float64) ** 2)) / 32768.0, 1e-10))
+                db = 20 * np.log10(
+                    max(
+                        np.sqrt(np.mean(samples.astype(np.float64) ** 2)) / 32768.0,
+                        1e-10,
+                    )
+                )
 
                 # ── drain pending results ────────────────────────────
                 while True:
@@ -410,7 +449,9 @@ class LiveTranslator:
                 raw_buf.extend(mono.tolist())
 
                 while len(raw_buf) >= vad.window:
-                    chunk = np.array([raw_buf.popleft() for _ in range(vad.window)], dtype=np.float32)
+                    chunk = np.array(
+                        [raw_buf.popleft() for _ in range(vad.window)], dtype=np.float32
+                    )
                     result = vad.process(chunk)
 
                     if result.get("type") == "final":
@@ -428,6 +469,7 @@ class LiveTranslator:
 
 
 # ── Convenience runner ───────────────────────────────────────────────────
+
 
 def main():
     translator = LiveTranslator()
