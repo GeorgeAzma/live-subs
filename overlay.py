@@ -248,10 +248,7 @@ class SubtitleOverlay(TextHandler):
         h = self._canvas_height
         fs = int(self._font_size * self._scale * 96.0 / 72.0)
 
-        if self._show_bg:
-            img = Image.new("RGBA", (w, h), (0, 0, 0, 128))
-        else:
-            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         try:
@@ -273,10 +270,27 @@ class SubtitleOverlay(TextHandler):
         total_h = len(lines) * line_h
         y_start = max(0, (h - total_h) // 2)
 
+        line_widths = [font.getlength(l) for l in lines]
+        max_w = max(line_widths)
         soff = self._soff
 
+        if self._show_bg:
+            hpad = int(18 * self._scale)
+            vpad = int(8 * self._scale)
+            cx = w // 2
+            bg_x1 = cx - int(max_w) // 2 - hpad
+            bg_y1 = y_start - vpad
+            bg_x2 = cx + int(max_w) // 2 + hpad
+            bg_y2 = y_start + total_h + vpad
+            radius = int(18 * self._scale)
+            draw.rounded_rectangle(
+                (bg_x1, bg_y1, bg_x2, bg_y2),
+                radius=radius,
+                fill=(0, 0, 0, 128),
+            )
+
         for i, line in enumerate(lines):
-            line_w = font.getlength(line)
+            line_w = line_widths[i]
             x = int((w - line_w) // 2)
             y = int(y_start + i * line_h)
 
