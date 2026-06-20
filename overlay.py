@@ -103,11 +103,14 @@ class SubtitleOverlay(TextHandler):
             width=wrap,
         )
 
-        # Second nearly-invisible window layered on top to capture
-        # mouse events across the text's bounding box (including the
-        # transparent gaps). -alpha keeps it click-capturing while
-        # making it visually imperceptible; -transparentcolor on the
-        # main window cannot do both at once.
+        # Second nearly-invisible window layered BEHIND the main
+        # overlay to capture mouse events across the text's bounding
+        # box (including the transparent gaps). The main overlay's
+        # transparent pixels are click-through via -transparentcolor,
+        # so clicks on gaps fall through to this window. -alpha keeps
+        # it click-capturing while making it visually imperceptible.
+        # Keeping it behind the text means it never veils the text's
+        # antialiased edges.
         self._hit_pad = max(6, int(6 * scale))
         self._input_win = tk.Toplevel(self.root)
         self._input_win.overrideredirect(True)
@@ -117,6 +120,8 @@ class SubtitleOverlay(TextHandler):
             self._input_win.attributes("-alpha", 0.01)
         except Exception:
             pass
+        # Re-assert root on top so the text renders above the veil.
+        self.root.attributes("-topmost", True)
 
         self._text = ""
         self._queue: queue.Queue[str] = queue.Queue()
@@ -159,12 +164,14 @@ class SubtitleOverlay(TextHandler):
 
     def _enable_drag(self):
         self._drag_start = None
-        self._input_win.bind("<Button-1>", self._on_drag_start)
-        self._input_win.bind("<B1-Motion>", self._on_drag_move)
+        for win in (self._input_win, self._canvas):
+            win.bind("<Button-1>", self._on_drag_start)
+            win.bind("<B1-Motion>", self._on_drag_move)
 
     def _on_drag_start(self, event):
         self._drag_start = (event.x_root, event.y_root)
         self._input_win.focus_force()
+        self.root.focus_force()
 
     def _on_drag_move(self, event):
         if self._drag_start is None:
@@ -180,9 +187,10 @@ class SubtitleOverlay(TextHandler):
     # ── font size via scroll ───────────────────────────────────────
 
     def _enable_scroll(self):
-        self._input_win.bind("<MouseWheel>", self._on_scroll)
-        self._input_win.bind("<Button-4>", self._on_scroll_up)
-        self._input_win.bind("<Button-5>", self._on_scroll_down)
+        for win in (self._input_win, self._canvas):
+            win.bind("<MouseWheel>", self._on_scroll)
+            win.bind("<Button-4>", self._on_scroll_up)
+            win.bind("<Button-5>", self._on_scroll_down)
 
     def _on_scroll(self, event):
         if event.delta > 0:
@@ -206,7 +214,32 @@ class SubtitleOverlay(TextHandler):
         wrap = self._canvas_width - int(100 * self._scale)
         self._canvas.itemconfig(self._shadow_id, font=font, width=wrap)
         self._canvas.itemconfig(self._text_id, font=font, width=wrap)
+        self._resize_to_fit_text()
         self._update_hit_box()
+
+    def _resize_to_fit_text(self):
+        """Resize the overlay window to fit the rendered text height."""
+        self.root.update_idletasks()
+        bbox = self._canvas.bbox(self._text_id)
+        if not bbox:
+            return
+        _, y1, _, y2 = bbox
+        pad = int(20 * self._scale)
+        target_h = (y2 - y1) + 2 * pad
+        min_h = max(150, int(150 * self._scale))
+        target_h = max(min_h, target_h)
+
+        rx = self.root.winfo_x()
+        ry = self.root.winfo_y()
+        current_bottom = ry + self._canvas_height
+        new_y = current_bottom - target_h
+
+        self.root.geometry(f"{self._canvas_width}x{int(target_h)}+{rx}+{int(new_y)}")
+        self._canvas_height = int(target_h)
+        self._cy = self._canvas_height // 2
+
+        self._canvas.coords(self._shadow_id, self._cx + self._soff, self._cy + self._soff)
+        self._canvas.coords(self._text_id, self._cx, self._cy)
 
     def _update_hit_box(self):
         """Position the invisible input window over the text bounding box."""
@@ -249,6 +282,7 @@ class SubtitleOverlay(TextHandler):
                 self._text = text
                 self._canvas.itemconfig(self._shadow_id, text=text)
                 self._canvas.itemconfig(self._text_id, text=text, fill="white")
+                self._resize_to_fit_text()
                 self._update_hit_box()
         except queue.Empty:
             pass
