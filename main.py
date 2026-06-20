@@ -36,7 +36,7 @@ transformers.logging.set_verbosity_error()
 
 @dataclass
 class Config:
-    model_name: str = "openai/whisper-large-v3-turbo"
+    model_name: str = "openai/whisper-large-v3"
     sample_rate: int = 16000
     vad_threshold: float = 0.5
     min_silence_ms: int = 200
