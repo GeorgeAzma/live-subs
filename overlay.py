@@ -7,6 +7,7 @@ Usage
     overlay.run()  # blocks until window closes
 """
 
+import os
 import queue
 import tkinter as tk
 from ctypes import windll
@@ -143,7 +144,7 @@ class SubtitleOverlay(TextHandler):
     # ── close via Escape ───────────────────────────────────────────
 
     def _enable_close(self):
-        self.root.bind("<Escape>", lambda e: self.root.quit())
+        self.root.bind("<Escape>", lambda e: os._exit(0))
 
     # ── TextHandler interface (called from pipeline thread) ────────
 

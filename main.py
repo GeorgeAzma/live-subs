@@ -44,6 +44,7 @@ class Config:
     min_segment_seconds: float = 1.0
     max_segment_seconds: float = 8.0
     interim_interval: float = 1.0
+    first_interim_min_seconds: float = 0.8
     inference_queue_size: int = 4
     vad_window: int = 512
     translate_token: int = 50359
@@ -157,6 +158,7 @@ class VoiceDetector:
         self.min_segment = int(cfg.sample_rate * cfg.min_segment_seconds)
         self.max_segment = int(cfg.sample_rate * cfg.max_segment_seconds)
         self.interim_interval = cfg.interim_interval
+        self.first_interim_min = int(cfg.sample_rate * cfg.first_interim_min_seconds)
 
         # utterance state
         self.speaking = False
@@ -217,6 +219,8 @@ class VoiceDetector:
             return None
         now = time.monotonic()
         if self.last_interim_time == 0:
+            if self.speech_samples < self.first_interim_min:
+                return None
             self.last_interim_time = now
             return np.concatenate(self.speech_chunks)
         if now - self.last_interim_time >= self.interim_interval:

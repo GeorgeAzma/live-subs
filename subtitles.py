@@ -7,6 +7,7 @@ Run:
 Press Escape to close the overlay and stop translation.
 """
 
+import os
 import threading
 
 from main import LiveTranslator
@@ -23,12 +24,6 @@ def main():
     overlay = SubtitleOverlay()
     translator.set_output(overlay)
 
-    def shutdown():
-        threading.Thread(target=translator.stop, daemon=True).start()
-        overlay.stop()
-
-    overlay.root.bind("<Escape>", lambda e: shutdown())
-
     t = threading.Thread(target=translator.run, daemon=True)
     t.start()
 
@@ -36,9 +31,8 @@ def main():
     try:
         overlay.run()
     except KeyboardInterrupt:
-        shutdown()
-    finally:
-        translator.stop()
+        pass
+    os._exit(0)
 
 
 if __name__ == "__main__":
