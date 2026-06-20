@@ -129,7 +129,7 @@ def _update_layered_window(hwnd: int, width: int, height: int, bgra_bytes: bytes
 
 
 class SubtitleOverlay(TextHandler):
-    MAX_SENTENCES = 3
+    MAX_SENTENCES = 6
     _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
     def __init__(self, font_size: int = 30):
@@ -147,7 +147,7 @@ class SubtitleOverlay(TextHandler):
         # Cap width to prevent overly wide subtitles
         w = min(sw, int(1000 * scale))
         # Fixed height for ~3 lines of text - prevents window jumping
-        h = max(180, int(180 * scale))
+        h = max(280, int(280 * scale))
         self.root.geometry(f"{w}x{h}+{int((sw - w) // 2)}+{sh - h - int(40 * scale)}")
 
         self._font_size = font_size
@@ -177,8 +177,9 @@ class SubtitleOverlay(TextHandler):
         self._partial_suffix = ""
         self._pending_partial = ""
         self._stable_count = 0
-        self._STABILIZE_CYCLES = 10
+        self._STABILIZE_CYCLES = 8
         self._is_partial = False
+        self._word_conf: list[int] = []
         self._queue: queue.Queue = queue.Queue()
         self._hwnd: Optional[int] = None
 
@@ -241,10 +242,28 @@ class SubtitleOverlay(TextHandler):
                 fill=(0, 0, 0, 128),
             )
 
-        if is_partial and self._text:
-            n_stable_words = len(self._text.split())
+        if not is_partial or not self._word_conf:
+            word_conf = None
+            conf_offset = 0
         else:
-            n_stable_words = float('inf')
+            full_words = (self._text + self._partial_suffix).split()
+            display_words = text.split()
+            conf_offset = len(full_words) - len(display_words) if len(full_words) >= len(display_words) else 0
+            word_conf = self._word_conf
+
+        def _word_brightness(pos: int) -> int:
+            if word_conf is None:
+                return 255
+            idx = conf_offset + pos
+            if idx < 0 or idx >= len(word_conf):
+                return 200
+            c = word_conf[idx]
+            if c >= 2:
+                return 255
+            elif c == 1:
+                return 230
+            else:
+                return 200
 
         if not is_idle:
             if self._soft_shadow:
@@ -274,9 +293,8 @@ class SubtitleOverlay(TextHandler):
             words = line.split()
             x = left_margin
             for word in words:
-                is_confirm = word_pos < n_stable_words
-                fg = (255, 255, 255, 255) if is_confirm else (120, 120, 120, 255)
-                draw.text((x, y), word, font=font, fill=fg)
+                b = _word_brightness(word_pos)
+                draw.text((x, y), word, font=font, fill=(b, b, b, 255))
                 x += font.getlength(word + " ")
                 word_pos += 1
 
@@ -463,6 +481,20 @@ class SubtitleOverlay(TextHandler):
         return i
 
     def _apply_partial(self, text: str):
+        old_display = self._text + self._partial_suffix
+        new_words = text.split()
+        old_words = old_display.split()
+        w_lcp = 0
+        while w_lcp < len(old_words) and w_lcp < len(new_words) and old_words[w_lcp].strip(",;:.!?") == new_words[w_lcp].strip(",;:.!?"):
+            w_lcp += 1
+        new_conf = []
+        for i in range(len(new_words)):
+            if i < w_lcp and i < len(self._word_conf):
+                new_conf.append(self._word_conf[i] + 1)
+            else:
+                new_conf.append(0)
+        self._word_conf = new_conf
+
         lcp = self._common_prefix_length(self._text, text)
         if lcp >= len(self._text):
             self._partial_suffix = text[lcp:]
@@ -489,6 +521,7 @@ class SubtitleOverlay(TextHandler):
                     self._pending_partial = ""
                     self._stable_count = 0
                     self._is_partial = False
+                    self._word_conf = []
                     self._redraw()
                     self._update_hit_box()
                 else:

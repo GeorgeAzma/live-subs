@@ -210,23 +210,28 @@ def asr_worker(
     stop_event: threading.Event,
     translate_ref: list,
 ):
-    while not stop_event.is_set():
-        try:
-            audio, is_final = inference_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        if audio is None:
-            break
-        inputs = processor(audio, return_tensors="pt", sampling_rate=Config.sample_rate)
-        input_features = inputs.input_features.to(model.device, dtype=model.dtype)
-        with torch.no_grad():
+    detected_language: Optional[str] = None
+    with torch.inference_mode():
+        while not stop_event.is_set():
+            try:
+                audio, is_final = inference_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if audio is None:
+                break
+            inputs = processor(audio, return_tensors="pt", sampling_rate=Config.sample_rate)
+            input_features = inputs.input_features.to(model.device, dtype=model.dtype)
+            if detected_language is None:
+                detected_language = _detect_language(model, input_features, processor)
             generated = model.generate(
                 input_features, temperature=0,
                 task="translate" if translate_ref[0] else "transcribe",
-                language=_detect_language(model, input_features, processor),
+                language=detected_language,
             )
-        text = _clean_text(processor.batch_decode(generated, skip_special_tokens=True)[0].strip())
-        result_queue.put((text, is_final))
+            text = _clean_text(processor.batch_decode(generated, skip_special_tokens=True)[0].strip())
+            result_queue.put((text, is_final))
+            if is_final:
+                detected_language = None
 
 
 class TextHandler:
@@ -306,7 +311,16 @@ class LiveTranslator:
     def _load_models(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading {self.cfg.model_name} on {device.upper()}...")
-        self._model = transformers.WhisperForConditionalGeneration.from_pretrained(self.cfg.model_name).to(device)
+        kwargs = {"torch_dtype": torch.float16}
+        if device == "cuda":
+            try:
+                import flash_attn  # noqa: F401
+                kwargs["attn_implementation"] = "flash_attention_2"
+            except ImportError:
+                pass
+        self._model = transformers.WhisperForConditionalGeneration.from_pretrained(self.cfg.model_name, **kwargs).to(device)
+        if device == "cuda" and self._model.dtype != torch.float16:
+            self._model.half()
         self._processor = transformers.AutoProcessor.from_pretrained(self.cfg.model_name)
         print("Model loaded.")
         print("Loading Silero VAD...")
