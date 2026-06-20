@@ -148,7 +148,6 @@ class SubtitleOverlay(TextHandler):
         self._scale = scale
         self._canvas_width = w
         self._canvas_height = h
-        self._soff = max(3, int(3 * scale))
 
         self._canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
         self._canvas.pack(expand=True, fill="both")
@@ -216,8 +215,8 @@ class SubtitleOverlay(TextHandler):
         max_w = max(line_widths)
 
         if self._show_bg:
-            hpad = int(18 * self._scale)
-            vpad = int(8 * self._scale)
+            hpad = int(fs * 0.5)
+            vpad = int(fs * 0.2)
             cx = w // 2
             draw.rounded_rectangle(
                 (
@@ -226,7 +225,7 @@ class SubtitleOverlay(TextHandler):
                     cx + int(max_w) // 2 + hpad,
                     y_start + total_h + vpad,
                 ),
-                radius=int(18 * self._scale),
+                radius=int(fs * 0.45),
                 fill=(0, 0, 0, 128),
             )
 
@@ -234,9 +233,8 @@ class SubtitleOverlay(TextHandler):
             x = int((w - line_widths[i]) // 2)
             y = int(y_start + i * line_h)
             fg = (180, 180, 180, 255) if is_idle else (255, 255, 255, 255)
-            draw.text(
-                (x + self._soff, y + self._soff), line, font=font, fill=(0, 0, 0, 255)
-            )
+            soff = max(1, int(fs * 0.08))
+            draw.text((x + soff, y + soff), line, font=font, fill=(0, 0, 0, 255))
             draw.text((x, y), line, font=font, fill=fg)
 
         return img
@@ -365,7 +363,8 @@ class SubtitleOverlay(TextHandler):
     def _resize_to_fit_text(self):
         display = self._text if self._text else "Listening..."
         _lines, _max_w, total_h, _line_h = self._measure_text(display)
-        pad = int(20 * self._scale)
+        fs = int(self._font_size * self._scale * 96.0 / 72.0)
+        pad = max(int(20 * self._scale), int(fs * 0.25))
         target_h = max(max(150, int(150 * self._scale)), total_h + 2 * pad)
         rx, ry = self.root.winfo_x(), self.root.winfo_y()
         self.root.geometry(
