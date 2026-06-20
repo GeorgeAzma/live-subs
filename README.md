@@ -1,6 +1,11 @@
 #### Live subtitles from desktop audio auto translated to English
 
-![image](./image.png)
+<table>
+  <tr>
+    <td><img src="image-1.png"></td>
+    <td><img src="image-2.png"></td>
+  </tr>
+</table>
 
 ### How To Use
 ``` bash
