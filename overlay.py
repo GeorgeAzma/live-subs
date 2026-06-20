@@ -243,7 +243,7 @@ class SubtitleOverlay(TextHandler):
                 img = Image.alpha_composite(img, shadow)
                 draw = ImageDraw.Draw(img)
             else:
-                soff = max(3, int(3 * self._scale))
+                soff = max(3, int(fs * 0.08))
                 for i, line in enumerate(lines):
                     x = int((w - line_widths[i]) // 2)
                     y = int(y_start + i * line_h)
