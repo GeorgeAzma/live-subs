@@ -1,6 +1,7 @@
 import ctypes
 import os
 import queue
+import re
 import tkinter as tk
 from ctypes import windll, wintypes
 from typing import Optional
@@ -128,6 +129,9 @@ def _update_layered_window(hwnd: int, width: int, height: int, bgra_bytes: bytes
 
 
 class SubtitleOverlay(TextHandler):
+    MAX_SENTENCES = 3
+    _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
+
     def __init__(self, font_size: int = 30):
         _enable_dpi_awareness()
         scale = _get_dpi_scale()
@@ -140,9 +144,11 @@ class SubtitleOverlay(TextHandler):
 
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w = sw
-        h = max(150, int(150 * scale))
-        self.root.geometry(f"{w}x{h}+0+{sh - h - int(40 * scale)}")
+        # Cap width to prevent overly wide subtitles
+        w = min(sw, int(1000 * scale))
+        # Fixed height for ~3 lines of text - prevents window jumping
+        h = max(180, int(180 * scale))
+        self.root.geometry(f"{w}x{h}+{int((sw - w) // 2)}+{sh - h - int(40 * scale)}")
 
         self._font_size = font_size
         self._scale = scale
@@ -168,7 +174,12 @@ class SubtitleOverlay(TextHandler):
         self._translator = None
         self._translating = True
         self._text = ""
-        self._queue: queue.Queue[str] = queue.Queue()
+        self._partial_suffix = ""
+        self._pending_partial = ""
+        self._stable_count = 0
+        self._STABILIZE_CYCLES = 10
+        self._is_partial = False
+        self._queue: queue.Queue = queue.Queue()
         self._hwnd: Optional[int] = None
 
         self.root.deiconify()
@@ -193,7 +204,7 @@ class SubtitleOverlay(TextHandler):
         except Exception:
             pass
 
-    def _render_text_image(self, text: str, is_idle: bool = False):
+    def _render_text_image(self, text: str, is_idle: bool = False, is_partial: bool = False):
         w = self._canvas_width
         h = self._canvas_height
         fs = int(self._font_size * self._scale * 96.0 / 72.0)
@@ -210,25 +221,30 @@ class SubtitleOverlay(TextHandler):
         ascent, descent = font.getmetrics()
         line_h = ascent + descent
         total_h = len(lines) * line_h
-        y_start = max(0, (h - total_h) // 2)
+        y_start = max(0, int(fs * 0.15))
 
         line_widths = [font.getlength(l) for l in lines]
         max_w = max(line_widths)
+        left_margin = int(50 * self._scale)
 
         if self._show_bg:
             hpad = int(fs * 0.5)
             vpad = int(fs * 0.2)
-            cx = w // 2
             draw.rounded_rectangle(
                 (
-                    cx - int(max_w) // 2 - hpad,
+                    left_margin - hpad,
                     y_start - vpad,
-                    cx + int(max_w) // 2 + hpad,
+                    left_margin + int(max_w) + hpad,
                     y_start + total_h + vpad,
                 ),
                 radius=int(fs * 0.45),
                 fill=(0, 0, 0, 128),
             )
+
+        if is_partial and self._text:
+            n_stable_words = len(self._text.split())
+        else:
+            n_stable_words = float('inf')
 
         if not is_idle:
             if self._soft_shadow:
@@ -236,7 +252,7 @@ class SubtitleOverlay(TextHandler):
                 shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
                 sdraw = ImageDraw.Draw(shadow)
                 for i, line in enumerate(lines):
-                    x = int((w - line_widths[i]) // 2)
+                    x = left_margin
                     y = int(y_start + i * line_h)
                     sdraw.text((x + soff, y + soff), line, font=font, fill=(0, 0, 0, 255))
                 shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(2, int(fs * 0.08))))
@@ -245,15 +261,24 @@ class SubtitleOverlay(TextHandler):
             else:
                 soff = max(3, int(fs * 0.08))
                 for i, line in enumerate(lines):
-                    x = int((w - line_widths[i]) // 2)
+                    x = left_margin
                     y = int(y_start + i * line_h)
                     draw.text((x + soff, y + soff), line, font=font, fill=(0, 0, 0, 255))
 
+        word_pos = 0
         for i, line in enumerate(lines):
-            x = int((w - line_widths[i]) // 2)
             y = int(y_start + i * line_h)
-            fg = (180, 180, 180, 255) if is_idle else (255, 255, 255, 255)
-            draw.text((x, y), line, font=font, fill=fg)
+            if is_idle:
+                draw.text((left_margin, y), line, font=font, fill=(180, 180, 180, 255))
+                continue
+            words = line.split()
+            x = left_margin
+            for word in words:
+                is_confirm = word_pos < n_stable_words
+                fg = (255, 255, 255, 255) if is_confirm else (120, 120, 120, 255)
+                draw.text((x, y), word, font=font, fill=fg)
+                x += font.getlength(word + " ")
+                word_pos += 1
 
         return img
 
@@ -274,28 +299,33 @@ class SubtitleOverlay(TextHandler):
 
     def _wrap_text(self, text: str, font, wrap_width: int):
         lines = []
-        for word in text.split():
-            if not lines:
-                lines.append(word)
-                continue
-            test = f"{lines[-1]} {word}"
-            if font.getlength(test) <= wrap_width:
-                lines[-1] = test
-            else:
-                lines.append(word)
+        for sentence in text.split("\n"):
+            words = sentence.split()
+            for i, word in enumerate(words):
+                if not lines or i == 0:
+                    lines.append(word)
+                else:
+                    test = f"{lines[-1]} {word}"
+                    if font.getlength(test) <= wrap_width:
+                        lines[-1] = test
+                    else:
+                        lines.append(word)
+        if not lines:
+            lines = [text]
         return lines
 
     def _redraw(self):
         if self._hwnd is None:
             self._hwnd = windll.user32.GetAncestor(self.root.winfo_id(), 2)
 
-        is_idle = not self._text
+        display_text = self._get_display_text()
+        is_idle = not display_text
         display = (
             "Transcribing..."
             if (is_idle and not self._translating)
-            else (self._text if self._text else "Listening...")
+            else (display_text if display_text else "Listening...")
         )
-        img = self._render_text_image(display, is_idle=is_idle)
+        img = self._render_text_image(display, is_idle=is_idle, is_partial=self._is_partial)
 
         arr = np.array(img, dtype=np.uint8)
         alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
@@ -385,7 +415,7 @@ class SubtitleOverlay(TextHandler):
         return lines, max(font.getlength(l) for l in lines), len(lines) * line_h, line_h
 
     def _resize_to_fit_text(self):
-        display = self._text if self._text else "Listening..."
+        display = self._get_display_text() or "Listening..."
         _lines, _max_w, total_h, _line_h = self._measure_text(display)
         fs = int(self._font_size * self._scale * 96.0 / 72.0)
         pad = max(int(20 * self._scale), int(fs * 0.25))
@@ -397,36 +427,84 @@ class SubtitleOverlay(TextHandler):
         self._canvas_height = int(target_h)
 
     def _update_hit_box(self):
-        display = self._text if self._text else "Listening..."
+        display = self._get_display_text() or "Listening..."
         lines, max_w, total_h, _ = self._measure_text(display)
         if not lines:
             lines = [display]
         pad = self._hit_pad
         w = int(max_w) + 2 * pad
         h = total_h + 2 * pad
-        y_start = max(0, int((self._canvas_height - total_h) // 2))
-        x_start = max(0, int((self._canvas_width - max_w) // 2))
+        fs = int(self._font_size * self._scale * 96.0 / 72.0)
+        y_start = max(0, int(fs * 0.15))
+        x_start = max(0, int(50 * self._scale))
         rx, ry = self.root.winfo_x(), self.root.winfo_y()
         self._input_win.geometry(f"{w}x{h}+{rx + x_start - pad}+{ry + y_start - pad}")
 
     def on_partial(self, text: str):
-        self._queue.put(text)
+        self._queue.put(("partial", text))
 
     def on_final(self, text: str):
-        self._queue.put(text)
+        self._queue.put(("final", text))
+
+    def _get_display_text(self) -> str:
+        full = self._text + self._partial_suffix
+        if not full:
+            return ""
+        sentences = [s.strip() for s in self._SENTENCE_SPLIT.split(full) if s.strip()]
+        if not sentences:
+            return full
+        return "\n".join(sentences[-self.MAX_SENTENCES:])
+
+    @staticmethod
+    def _common_prefix_length(s1: str, s2: str) -> int:
+        i = 0
+        while i < len(s1) and i < len(s2) and s1[i] == s2[i]:
+            i += 1
+        return i
+
+    def _apply_partial(self, text: str):
+        lcp = self._common_prefix_length(self._text, text)
+        if lcp >= len(self._text):
+            self._partial_suffix = text[lcp:]
+        elif lcp >= len(self._text) * 0.5:
+            self._text = text[:lcp]
+            self._partial_suffix = text[lcp:]
+        else:
+            self._text = text
+            self._partial_suffix = ""
+        self._is_partial = True
+        self._redraw()
+        self._update_hit_box()
 
     def _poll(self):
         try:
             while True:
-                text = self._queue.get_nowait()
-                if text == self._text:
+                kind, text = self._queue.get_nowait()
+                raw = self._text + self._partial_suffix
+                if text == raw:
                     continue
-                self._text = text
-                self._resize_to_fit_text()
-                self._redraw()
-                self._update_hit_box()
+                if kind == "final":
+                    self._text = text
+                    self._partial_suffix = ""
+                    self._pending_partial = ""
+                    self._stable_count = 0
+                    self._is_partial = False
+                    self._redraw()
+                    self._update_hit_box()
+                else:
+                    if text == self._pending_partial:
+                        self._stable_count += 1
+                    else:
+                        self._pending_partial = text
+                        self._stable_count = 0
         except queue.Empty:
             pass
+
+        if self._pending_partial and self._stable_count >= self._STABILIZE_CYCLES:
+            raw = self._text + self._partial_suffix
+            if self._pending_partial != raw:
+                self._apply_partial(self._pending_partial)
+
         self.root.after(50, self._poll)
 
     def run(self):
