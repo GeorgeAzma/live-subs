@@ -169,7 +169,7 @@ class SubtitleOverlay(TextHandler):
             pass
         self.root.attributes("-topmost", True)
 
-        self._show_bg = False
+        self._show_bg = True
         self._soft_shadow = False
         self._translator = None
         self._translating = True
@@ -180,6 +180,7 @@ class SubtitleOverlay(TextHandler):
         self._STABILIZE_CYCLES = 8
         self._is_partial = False
         self._word_conf: list[int] = []
+        self._status = "Starting..."  # shown while models load; cleared on ready
         self._queue: queue.Queue = queue.Queue()
         self._hwnd: Optional[int] = None
 
@@ -222,7 +223,8 @@ class SubtitleOverlay(TextHandler):
         ascent, descent = font.getmetrics()
         line_h = ascent + descent
         total_h = len(lines) * line_h
-        y_start = max(0, int(fs * 0.15))
+        vpad = int(fs * 0.2) if self._show_bg else 0
+        y_start = max(vpad + 1, int(fs * 0.15))
 
         line_widths = [font.getlength(l) for l in lines]
         max_w = max(line_widths)
@@ -230,17 +232,14 @@ class SubtitleOverlay(TextHandler):
 
         if self._show_bg:
             hpad = int(fs * 0.5)
-            vpad = int(fs * 0.2)
-            draw.rounded_rectangle(
-                (
-                    left_margin - hpad,
-                    y_start - vpad,
-                    left_margin + int(max_w) + hpad,
-                    y_start + total_h + vpad,
-                ),
-                radius=int(fs * 0.45),
-                fill=(0, 0, 0, 128),
+            rect = (
+                left_margin - hpad,
+                y_start - vpad,
+                left_margin + int(max_w) + hpad,
+                y_start + total_h + vpad,
             )
+            img = self._draw_bg(img, rect)
+            draw = ImageDraw.Draw(img)
 
         if not is_partial or not self._word_conf:
             word_conf = None
@@ -300,6 +299,42 @@ class SubtitleOverlay(TextHandler):
 
         return img
 
+    def _draw_bg(self, img: Image.Image, rect: tuple) -> Image.Image:
+        """Draw the translucent rounded background with antialiased edges.
+
+        Pillow's rounded_rectangle is not antialiased, so the shape is rendered
+        at 4x resolution on its own layer and downscaled with LANCZOS, giving
+        smooth edges and corners. The rect is clamped so corners never extend
+        past the window edge (which would cut them off).
+        """
+        w, h = img.size
+        SS = 4  # supersample factor
+
+        # Clamp: keep the rect inside the canvas with at least a 1px margin so
+        # rounded corners are never clipped by the window boundary.
+        x0 = max(1, rect[0])
+        y0 = max(1, rect[1])
+        x1 = min(w - 1, rect[2])
+        y1 = min(h - 1, rect[3])
+
+        mask = Image.new("L", (w * SS, h * SS), 0)
+        mdraw = ImageDraw.Draw(mask)
+        radius = int((y1 - y0) * 0.35) * SS
+        mdraw.rounded_rectangle(
+            (x0 * SS, y0 * SS, x1 * SS, y1 * SS),
+            radius=radius,
+            fill=255,
+        )
+        mask = mask.resize((w, h), Image.LANCZOS)
+
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ldraw = ImageDraw.Draw(layer)
+        ldraw.rectangle((0, 0, w, h), fill=(0, 0, 0, 128))
+        layer.putalpha(Image.composite(
+            Image.new("L", (w, h), 128), Image.new("L", (w, h), 0), mask
+        ))
+        return Image.alpha_composite(img, layer)
+
     def _load_font(self, fs: int, text: str = ""):
         candidates = ["segoeuib.ttf"]
         if any(0x2E80 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF for c in text):
@@ -332,18 +367,32 @@ class SubtitleOverlay(TextHandler):
             lines = [text]
         return lines
 
+    def set_status(self, text: str):
+        """Show a loading/progress message in place of subtitles.
+
+        Safe to call from any thread: the update is applied on the Tk main
+        loop via the queue.
+        """
+        self._queue.put(("status", text or ""))
+
     def _redraw(self):
         if self._hwnd is None:
             self._hwnd = windll.user32.GetAncestor(self.root.winfo_id(), 2)
 
         display_text = self._get_display_text()
         is_idle = not display_text
-        display = (
-            "Transcribing..."
-            if (is_idle and not self._translating)
-            else (display_text if display_text else "Listening...")
+        if self._status:
+            display = self._status
+            is_loading = True
+        elif is_idle:
+            display = "Transcribing..." if not self._translating else "Listening..."
+            is_loading = False
+        else:
+            display = display_text
+            is_loading = False
+        img = self._render_text_image(
+            display, is_idle=is_idle or is_loading, is_partial=self._is_partial
         )
-        img = self._render_text_image(display, is_idle=is_idle, is_partial=self._is_partial)
 
         arr = np.array(img, dtype=np.uint8)
         alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
@@ -453,7 +502,8 @@ class SubtitleOverlay(TextHandler):
         w = int(max_w) + 2 * pad
         h = total_h + 2 * pad
         fs = int(self._font_size * self._scale * 96.0 / 72.0)
-        y_start = max(0, int(fs * 0.15))
+        vpad = int(fs * 0.2) + 1 if self._show_bg else 0
+        y_start = max(vpad, int(fs * 0.15))
         x_start = max(0, int(50 * self._scale))
         rx, ry = self.root.winfo_x(), self.root.winfo_y()
         self._input_win.geometry(f"{w}x{h}+{rx + x_start - pad}+{ry + y_start - pad}")
@@ -512,6 +562,12 @@ class SubtitleOverlay(TextHandler):
         try:
             while True:
                 kind, text = self._queue.get_nowait()
+                if kind == "status":
+                    if self._status != text:
+                        self._status = text
+                        self._redraw()
+                        self._update_hit_box()
+                    continue
                 raw = self._text + self._partial_suffix
                 if text == raw:
                     continue

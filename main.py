@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import queue
 import sys
 import threading
@@ -5,15 +7,37 @@ import time
 import warnings
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
+
 import numpy as np
-import pyaudiowpatch as pyaudio
-import silero_vad
-import torch
-import transformers
 
 warnings.filterwarnings("ignore")
-transformers.logging.set_verbosity_error()
+
+# Heavy modules (torch, transformers, silero_vad, pyaudio) are imported lazily
+# via _import_heavy() so that importing this module -- and therefore showing
+# the overlay UI -- is near-instant.
+torch = None
+transformers = None
+silero_vad = None
+pyaudio = None
+_heavy_imported = False
+
+
+def _import_heavy():
+    """Import the slow ML/audio modules once, on demand."""
+    global torch, transformers, silero_vad, pyaudio, _heavy_imported
+    if _heavy_imported:
+        return
+    import pyaudiowpatch as _pyaudio
+    import silero_vad as _silero_vad
+    import torch as _torch
+    import transformers as _transformers
+
+    pyaudio, silero_vad, torch, transformers = (
+        _pyaudio, _silero_vad, _torch, _transformers,
+    )
+    _transformers.logging.set_verbosity_error()
+    _heavy_imported = True
 
 
 @dataclass
@@ -261,6 +285,7 @@ class LiveTranslator:
         self.cfg = cfg or Config()
         self._device_index = device_index
         self._output = output or PrintHandler()
+        self._status_cb: Optional[Callable[[str], None]] = None
         self._running = False
         self._model: Optional[transformers.WhisperForConditionalGeneration] = None
         self._processor: Optional[transformers.WhisperProcessor] = None
@@ -270,13 +295,30 @@ class LiveTranslator:
         self._result_queue: Optional[queue.Queue] = None
         self._stop_event: Optional[threading.Event] = None
         self._worker_thread: Optional[threading.Thread] = None
+        self._started = threading.Event()  # set once models/audio are ready
         self._translate_enabled = [True]
 
     def set_output(self, handler: TextHandler):
         self._output = handler
 
+    def set_status_callback(self, cb: Optional[Callable[[str], None]]):
+        """Register a callback invoked with progress messages during startup."""
+        self._status_cb = cb
+
+    def _status(self, msg: str):
+        if self._status_cb:
+            try:
+                self._status_cb(msg)
+            except Exception:
+                pass
+        print(msg)
+
     def start(self):
+        self._status("Importing libraries (this takes a moment)...")
+        _import_heavy()
+        self._status("Loading models...")
         self._load_models()
+        self._status("Opening audio device...")
         self._audio = AudioCapture(device_index=self._device_index).open()
         self._vad = VoiceDetector(self.cfg)
         self._inference_queue = queue.Queue(maxsize=self.cfg.inference_queue_size)
@@ -290,8 +332,13 @@ class LiveTranslator:
         )
         self._worker_thread.start()
         self._running = True
+        self._started.set()
+        self._status("Ready.")
 
     def run(self):
+        # Block until start() finishes loading models and audio, so the
+        # pipeline loop can be launched in a thread before loading completes.
+        self._started.wait()
         try:
             self._pipeline_loop()
         finally:
@@ -310,22 +357,21 @@ class LiveTranslator:
 
     def _load_models(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading {self.cfg.model_name} on {device.upper()}...")
-        kwargs = {"torch_dtype": torch.float16}
+        self._status(f"Loading {self.cfg.model_name} on {device.upper()}...")
+        kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
         if device == "cuda":
-            try:
-                import flash_attn  # noqa: F401
+            # Fast check instead of a full `import flash_attn`, which can
+            # pull in CUDA extensions and noticeably slow startup.
+            from importlib.util import find_spec
+            if find_spec("flash_attn") is not None:
                 kwargs["attn_implementation"] = "flash_attention_2"
-            except ImportError:
-                pass
         self._model = transformers.WhisperForConditionalGeneration.from_pretrained(self.cfg.model_name, **kwargs).to(device)
         if device == "cuda" and self._model.dtype != torch.float16:
             self._model.half()
         self._processor = transformers.AutoProcessor.from_pretrained(self.cfg.model_name)
-        print("Model loaded.")
-        print("Loading Silero VAD...")
+        self._status("Loading Silero VAD...")
         silero_vad.load_silero_vad()
-        print("VAD loaded.\n")
+        self._status("Model loaded.")
 
     def toggle_translate(self):
         self._translate_enabled[0] = not self._translate_enabled[0]
