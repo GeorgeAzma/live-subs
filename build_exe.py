@@ -49,6 +49,9 @@ def main():
         "--hidden-import", "PIL._tkinter_finder",
         "--hidden-import", "silero_vad",
         "--hidden-import", "pyaudiowpatch",
+        "--hidden-import", "soxr",
+        # pystray picks its platform backend at runtime
+        "--hidden-import", "pystray._win32",
         "--hidden-import", "ctypes",
         "--hidden-import", "ctypes.wintypes",
         "--hidden-import", "queue",

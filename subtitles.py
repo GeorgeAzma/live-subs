@@ -1,8 +1,8 @@
-import os
 import threading
 
 from main import LiveTranslator
 from overlay import SubtitleOverlay
+from tray import TrayIcon
 
 
 def main():
@@ -10,6 +10,10 @@ def main():
     # then load the heavy models in a background thread.
     overlay = SubtitleOverlay()
     overlay.set_status("Loading...")
+    tray = TrayIcon(overlay)
+    overlay.add_exit_hook(tray.stop)
+    overlay.add_state_hook(tray.refresh)
+    tray.start()
 
     translator = LiveTranslator()
     overlay.set_translator(translator)
@@ -30,12 +34,12 @@ def main():
     t = threading.Thread(target=translator.run, daemon=True)
     t.start()
 
-    print("Subtitle overlay opened (Escape to exit).")
+    print("Subtitle overlay opened (Escape or the tray icon to exit).")
     try:
         overlay.run()
     except KeyboardInterrupt:
         pass
-    os._exit(0)
+    overlay.exit()
 
 
 if __name__ == "__main__":
